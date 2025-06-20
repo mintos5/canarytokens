@@ -37,7 +37,7 @@ class WebhookOutputChannel(OutputChannel):
         # TODO we should format using the hit directly,
         #      we use the drop to get the latest when we already have it
         url = canarydrop.alert_webhook_url
-        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("kafka://")):
+        if not (url.startswith("http://") or url.startswith("https://")):
             log.error(
                 f"alert_webhook_url must start with http[s]://; url found for drop {canarydrop.canarytoken.value()}: {url}"
             )
@@ -65,7 +65,7 @@ class WebhookOutputChannel(OutputChannel):
         webhook_type = get_webhook_type(url)
         payload = format_details_for_webhook(webhook_type, details)
         if webhook_type == WebhookType.KAFKA:
-            kafka_topic = url.split("kafka://")[1]
+            kafka_topic = url.split("kafka.test/")[1]
             env_log_file = os.getenv("LOG_FILE")
             if env_log_file:
                 path = os.path.dirname(env_log_file)
