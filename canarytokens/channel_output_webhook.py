@@ -1,7 +1,7 @@
 """
 Output channel that sends to webhooks.
 """
-
+import json
 import os
 from typing import Dict, Union
 
@@ -73,7 +73,7 @@ class WebhookOutputChannel(OutputChannel):
             else:
                 json_data = "json_data_{}.jsonl".format(kafka_topic)
             with open(json_data, 'a+', encoding='utf-8') as f:
-                f.write(payload.json_safe_dict() + "\n")
+                f.write(json.dumps(payload.json_safe_dict()) + "\n")
         success = self.generic_webhook_send(
             payload=payload.json_safe_dict(),
             alert_webhook_url=canarydrop.alert_webhook_url,
