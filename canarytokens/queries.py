@@ -894,6 +894,8 @@ def validate_webhook(url, token_type: models.TokenTypes):
 
     webhook_type = get_webhook_type(url)
     payload = generate_webhook_test_payload(webhook_type, token_type)
+    if isinstance(payload, str) and payload == "fake_kafka_payload":
+        return
 
     response = advocate.post(
         url,

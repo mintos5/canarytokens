@@ -53,6 +53,7 @@ class WebhookType(Enum):
     DISCORD = "discord"
     MS_TEAMS = "ms-teams"
     GENERIC = "generic"
+    KAFKA = "kafka"
 
 
 def _match_url_start(url: str, match_str: str) -> bool:
@@ -75,6 +76,9 @@ _WEBHOOK_URL_MATCH_CRITERIA = {
     ),
     WebhookType.MS_TEAMS: partial(
         _match_url_regex, match_regex=constants.WEBHOOK_BASE_URL_REGEX_MS_TEAMS
+    ),
+    WebhookType.KAFKA: partial(
+        _match_url_regex, match_regex=constants.WEBHOOK_FAKE_URL_REGEX_KAFKA
     ),
 }
 
@@ -107,6 +111,8 @@ def _format_alert_details_for_webhook(
         return _format_as_discord_canaryalert(details)
     elif webhook_type == WebhookType.MS_TEAMS:
         return _format_as_ms_teams_canaryalert(details)
+    elif webhook_type == WebhookType.KAFKA:
+        return TokenAlertDetailGeneric(**details.dict())
     elif webhook_type == WebhookType.GENERIC:
         return TokenAlertDetailGeneric(**details.dict())
     else:
@@ -191,6 +197,8 @@ def generate_webhook_test_payload(webhook_type: WebhookType, token_type: TokenTy
             },
             time=datetime.now(),
         )
+    elif webhook_type == WebhookType.KAFKA:
+        return "fake_kafka_payload"
     else:
         raise NotImplementedError(
             f"generate_webhook_test_payload not implemented for {webhook_type}"

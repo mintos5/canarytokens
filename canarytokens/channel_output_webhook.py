@@ -2,6 +2,7 @@
 Output channel that sends to webhooks.
 """
 
+import os
 from typing import Dict, Union
 
 import advocate
@@ -19,7 +20,7 @@ from canarytokens.models import (
     TokenExposedDetails,
     TokenExposedHit,
 )
-from canarytokens.webhook_formatting import format_details_for_webhook, get_webhook_type
+from canarytokens.webhook_formatting import format_details_for_webhook, get_webhook_type, WebhookType
 
 log = Logger()
 
@@ -36,7 +37,7 @@ class WebhookOutputChannel(OutputChannel):
         # TODO we should format using the hit directly,
         #      we use the drop to get the latest when we already have it
         url = canarydrop.alert_webhook_url
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("kafka://")):
             log.error(
                 f"alert_webhook_url must start with http[s]://; url found for drop {canarydrop.canarytoken.value()}: {url}"
             )
@@ -63,7 +64,16 @@ class WebhookOutputChannel(OutputChannel):
 
         webhook_type = get_webhook_type(url)
         payload = format_details_for_webhook(webhook_type, details)
-
+        if webhook_type == WebhookType.KAFKA:
+            kafka_topic = url.split("kafka://")[1]
+            env_log_file = os.getenv("LOG_FILE")
+            if env_log_file:
+                path = os.path.dirname(env_log_file)
+                json_data = os.path.join(path, "json_data_{}.jsonl".format(kafka_topic))
+            else:
+                json_data = "json_data_{}.jsonl".format(kafka_topic)
+            with open(json_data, 'a+', encoding='utf-8') as f:
+                f.write(payload.json_safe_dict() + "\n")
         success = self.generic_webhook_send(
             payload=payload.json_safe_dict(),
             alert_webhook_url=canarydrop.alert_webhook_url,
