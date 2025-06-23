@@ -66,22 +66,33 @@ class WebhookOutputChannel(OutputChannel):
         webhook_type = get_webhook_type(url)
         payload = format_details_for_webhook(webhook_type, details)
         if webhook_type == WebhookType.KAFKA:
-            kafka_topic = url.split("kafka.test/")[1]
-            # env_log_file = os.getenv("LOG_FILE")
-            # if env_log_file:
-            #     path = os.path.dirname(env_log_file)
-            #     json_data = os.path.join(path, "json_data_{}.jsonl".format(kafka_topic))
-            # else:
-            #     json_data = "json_data_{}.jsonl".format(kafka_topic)
-            # with open(json_data, 'a+', encoding='utf-8') as f:
-            #     f.write(json.dumps(payload.json_safe_dict()) + "\n")
-            kafka_send(payload.json_safe_dict(), kafka_topic)
-            canarydrop.clear_alert_failures()
-            return
-        success = self.generic_webhook_send(
-            payload=payload.json_safe_dict(),
-            alert_webhook_url=canarydrop.alert_webhook_url,
-        )
+            kafka_topic_broker = url.split("kafka.test/")[1].split("/")
+            if kafka_topic_broker:
+                kafka_topic = kafka_topic_broker[0]
+                if len(kafka_topic_broker) > 1:
+                    kafka_broker = kafka_topic_broker[1]
+                else:
+                    kafka_broker = None
+                # env_log_file = os.getenv("LOG_FILE")
+                # if env_log_file:
+                #     path = os.path.dirname(env_log_file)
+                #     json_data = os.path.join(path, "json_data_{}.jsonl".format(kafka_topic))
+                # else:
+                #     json_data = "json_data_{}.jsonl".format(kafka_topic)
+                # with open(json_data, 'a+', encoding='utf-8') as f:
+                #     f.write(json.dumps(payload.json_safe_dict()) + "\n")
+                if kafka_broker:
+                    kafka_send(payload.json_safe_dict(), kafka_topic, broker_list=[kafka_broker, ])
+                else:
+                    kafka_send(payload.json_safe_dict(), kafka_topic)
+                success = True
+            else:
+                success = False
+        else:
+            success = self.generic_webhook_send(
+                payload=payload.json_safe_dict(),
+                alert_webhook_url=canarydrop.alert_webhook_url,
+            )
         if success:
             canarydrop.clear_alert_failures()
         else:

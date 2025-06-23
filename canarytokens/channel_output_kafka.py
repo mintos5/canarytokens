@@ -8,7 +8,7 @@ KAFKA_BROKER_LIST = [
 DEFAULT_TOPIC = 'deceptor_test'
 
 
-def kafka_send(message, topic):
-    kafka_producer = KafkaProducer(bootstrap_servers=KAFKA_BROKER_LIST,
+def kafka_send(message, topic, broker_list=KAFKA_BROKER_LIST):
+    kafka_producer = KafkaProducer(bootstrap_servers=broker_list,
                                    value_serializer=lambda m: json.dumps(m).encode('ascii'))
     kafka_producer.send(topic, message).get(timeout=10)
