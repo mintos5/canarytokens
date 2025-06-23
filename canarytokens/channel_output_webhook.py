@@ -12,6 +12,7 @@ from twisted.logger import Logger
 
 from canarytokens import canarydrop
 from canarytokens.channel import InputChannel, OutputChannel
+from canarytokens.channel_output_kafka import kafka_send
 from canarytokens.constants import OUTPUT_CHANNEL_WEBHOOK
 from canarytokens.models import (
     AnyTokenHit,
@@ -66,14 +67,17 @@ class WebhookOutputChannel(OutputChannel):
         payload = format_details_for_webhook(webhook_type, details)
         if webhook_type == WebhookType.KAFKA:
             kafka_topic = url.split("kafka.test/")[1]
-            env_log_file = os.getenv("LOG_FILE")
-            if env_log_file:
-                path = os.path.dirname(env_log_file)
-                json_data = os.path.join(path, "json_data_{}.jsonl".format(kafka_topic))
-            else:
-                json_data = "json_data_{}.jsonl".format(kafka_topic)
-            with open(json_data, 'a+', encoding='utf-8') as f:
-                f.write(json.dumps(payload.json_safe_dict()) + "\n")
+            # env_log_file = os.getenv("LOG_FILE")
+            # if env_log_file:
+            #     path = os.path.dirname(env_log_file)
+            #     json_data = os.path.join(path, "json_data_{}.jsonl".format(kafka_topic))
+            # else:
+            #     json_data = "json_data_{}.jsonl".format(kafka_topic)
+            # with open(json_data, 'a+', encoding='utf-8') as f:
+            #     f.write(json.dumps(payload.json_safe_dict()) + "\n")
+            kafka_send(payload.json_safe_dict(), kafka_topic)
+            canarydrop.clear_alert_failures()
+            return
         success = self.generic_webhook_send(
             payload=payload.json_safe_dict(),
             alert_webhook_url=canarydrop.alert_webhook_url,
