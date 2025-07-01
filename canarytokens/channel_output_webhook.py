@@ -3,6 +3,7 @@ Output channel that sends to webhooks.
 """
 import json
 import os
+import datetime
 from typing import Dict, Union
 
 import advocate
@@ -81,10 +82,21 @@ class WebhookOutputChannel(OutputChannel):
                 #     json_data = "json_data_{}.jsonl".format(kafka_topic)
                 # with open(json_data, 'a+', encoding='utf-8') as f:
                 #     f.write(json.dumps(payload.json_safe_dict()) + "\n")
+                # Do some changes to the payload data to be sent
+                token_payload = payload.json_safe_dict()
+                # Fix the time format of the message
+                if token_payload["time"]:
+                    try:
+                        datetime_object = datetime.datetime.strptime(token_payload["time"],
+                                                                     '%Y-%m-%d %H:%M:%S (%Z)').replace(
+                            tzinfo=datetime.timezone.utc)
+                        token_payload["time"] = datetime_object.isoformat()
+                    except ValueError as e:
+                        pass  # leave the original value
                 if kafka_broker:
-                    kafka_send(payload.json_safe_dict(), kafka_topic, broker_list=[kafka_broker, ])
+                    kafka_send(token_payload, kafka_topic, broker_list=[kafka_broker, ])
                 else:
-                    kafka_send(payload.json_safe_dict(), kafka_topic)
+                    kafka_send(token_payload, kafka_topic)
                 success = True
             else:
                 success = False
