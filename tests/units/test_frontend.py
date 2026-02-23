@@ -10,6 +10,8 @@ from pydantic import HttpUrl
 
 from canarytokens import canarydrop, models, queries, constants
 from canarytokens.models import (
+    AWSInfraTokenRequest,
+    AWSInfraTokenResponse,
     AnyDownloadRequest,
     AnyTokenRequest,
     AnyTokenResponse,
@@ -17,6 +19,8 @@ from canarytokens.models import (
     AWSKeyTokenResponse,
     AzureIDTokenRequest,
     AzureIDTokenResponse,
+    CrowdStrikeCCTokenRequest,
+    CrowdStrikeCCTokenResponse,
     BrowserScannerSettingsRequest,
     CCTokenRequest,
     CCTokenResponse,
@@ -162,6 +166,8 @@ set_of_unsupported_request_classes = [
     CustomBinaryTokenRequest,
     PWATokenRequest,
     CreditCardV2TokenRequest,
+    AWSInfraTokenRequest,  # no download
+    CrowdStrikeCCTokenRequest,  # requires external gateway
 ]
 set_of_unsupported_response_classes = [
     AWSKeyTokenResponse,
@@ -171,7 +177,14 @@ set_of_unsupported_response_classes = [
     CustomBinaryTokenResponse,
     PWATokenResponse,
     CreditCardV2TokenResponse,
+    AWSInfraTokenResponse,  # no download
+    CrowdStrikeCCTokenResponse,  # requires external gateway
 ]
+
+if not FrontendSettings("../frontend/frontend.env").WEBDAV_SERVER:
+    # The Cloudflare settings for webdav aren't present
+    set_of_unsupported_request_classes += [WebDavTokenRequest]
+    set_of_unsupported_response_classes += [WebDavTokenResponse]
 
 [set_of_response_classes.remove(o) for o in set_of_unsupported_response_classes]
 [set_of_request_classes.remove(o) for o in set_of_unsupported_request_classes]
@@ -205,6 +218,32 @@ def test_creating_all_tokens(
 def test_get_commit_sha(test_client: TestClient) -> None:
     resp = test_client.get("/commitsha")
     assert resp.status_code == 200
+
+
+def test_get_robots_txt(test_client: TestClient) -> None:
+    resp = test_client.get("/robots.txt")
+    assert resp.status_code == 200
+    assert resp.text.startswith("User-agent: *")
+    assert "Disallow: /history" in resp.text
+    assert "Disallow: /manage" in resp.text
+
+
+def test_get_security_txt(test_client: TestClient) -> None:
+    resp = test_client.get("/.well-known/security.txt")
+    assert resp.status_code == 200
+    assert (
+        "Acknowledgements: https://github.com/thinkst/canarytokens/security/advisories"
+        in resp.text
+    )
+    assert "Expires: " in resp.text
+    expiry_date = re.search(r"Expires:\s*(\S+)", resp.text).group(1)
+    # Check that the expiry date is in the future
+    from datetime import datetime, timezone
+
+    expiry_datetime = datetime.fromisoformat(expiry_date.replace("Z", "+00:00"))
+    assert expiry_datetime > datetime.now(
+        timezone.utc
+    ), "Update the security.txt expiry date!"
 
 
 @pytest.mark.parametrize(
@@ -817,7 +856,8 @@ def test_webdav_no_cloudflare(
     setup_db,
 ) -> None:
     """
-    Test whether a Canarytokens instance with no Network Folder enabled returns the correct response."""
+    Test whether a Canarytokens instance with no Network Folder enabled returns the correct response.
+    """
     from frontend.app import _create_webdav_token_response
 
     token_request_details = WebDavTokenRequest(
@@ -951,3 +991,37 @@ def test_generate_token_ip_headers(
     canarydrop = manage_resp.json()["canarydrop"]
     for key, value in expected_headers.items():
         assert canarydrop[key] == value
+
+
+@pytest.mark.parametrize(
+    "ip_ignore_list, is_valid",
+    [
+        (["2406:da11:e7:2232:c89a:e0f0:71b7:d55a"], False),
+        (["not an ip"], False),
+        (["192.168.2.10"], True),
+        ([], True),
+        (["1.2.3.4.5"], False),
+    ],
+)
+def test_add_ip_ignore_list(
+    ip_ignore_list: list[str],
+    is_valid: bool,
+    test_client: TestClient,
+    setup_db: None,
+) -> None:
+    token_request = get_token_request(WebBugTokenRequest)
+    token_resp = test_client.post(
+        "/generate",
+        data=token_request.json(),
+    ).json()
+    data = {
+        "token": token_resp["token"],
+        "auth": token_resp["auth_token"],
+        "ip_ignore_list": ip_ignore_list,
+    }
+
+    resp = test_client.post(
+        f"{ROOT_API_ENDPOINT}/settings/ip-ignore-list",
+        json=data,
+    )
+    assert resp.status_code == (200 if is_valid else 422)

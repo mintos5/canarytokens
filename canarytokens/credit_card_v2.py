@@ -7,7 +7,12 @@ from canarytokens.settings import FrontendSettings
 from canarytokens.models import Canarytoken
 from dataclasses import dataclass
 from typing import Optional, Tuple, Literal, Union
-from enum import Enum
+import sys
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum  # Python 3.11+
+else:
+    from backports.strenum import StrEnum  # Python < 3.11
 from pydantic import BaseModel
 
 
@@ -18,16 +23,16 @@ _CACHED_LAMBDA_CLIENT = None
 _RETRY_COUNT = 2
 
 
-class Lambda(Enum):
+class Lambda(StrEnum):
     PAYMENTS_DEMO = "CreditCardPaymentsDemoBackend"
 
 
-class _Api(Enum):
+class _Api(StrEnum):
     CARD_CREATE = "/card/create"
     CUSTOMER_DETAILS = "/customer/details"
 
 
-class Status(Enum):
+class Status(StrEnum):
     SUCCESS = "success"
     CUSTOMER_NOT_FOUND = "customer_not_found"
     NO_AVAILABLE_CARDS = "no_cards"
@@ -36,7 +41,7 @@ class Status(Enum):
     FORBIDDEN = "forbidden"
 
 
-class TriggerWebhookEvent(str, Enum):
+class TriggerWebhookEvent(StrEnum):
     TransactionFailed = "issuing.transaction.failed"
     ThreeDSecureNotification = "issuing.3ds_notification.stepup_otp"
 
@@ -61,19 +66,21 @@ class Customer:
 
 
 class CreditCardTrigger3DSNotification(BaseModel):
-    trigger_type: Literal[
+    trigger_type: Literal[TriggerWebhookEvent.ThreeDSecureNotification] = (
         TriggerWebhookEvent.ThreeDSecureNotification
-    ] = TriggerWebhookEvent.ThreeDSecureNotification
+    )
     canarytoken: Optional[str]
     masked_card_number: Optional[str]
+    merchant: Optional[str]
     transaction_amount: Optional[str]
     transaction_currency: Optional[str]
+    merchant_identifier: Optional[str]
 
 
 class CreditCardTriggerTransaction(BaseModel):
-    trigger_type: Literal[
+    trigger_type: Literal[TriggerWebhookEvent.TransactionFailed] = (
         TriggerWebhookEvent.TransactionFailed
-    ] = TriggerWebhookEvent.TransactionFailed
+    )
     canarytoken: Canarytoken
     masked_card_number: Optional[str]
     merchant: Optional[str]
@@ -82,6 +89,7 @@ class CreditCardTriggerTransaction(BaseModel):
     transaction_date: Optional[str]
     transaction_type: Optional[str]
     status: Optional[str]
+    merchant_identifier: Optional[str]
 
 
 AnyCreditCardTrigger = Union[
@@ -138,7 +146,8 @@ def _invoke_lambda(lambda_name: str, payload: dict) -> dict:
             )
         except botocore.exceptions.ClientError as err:
             if (
-                err.response["Error"]["Code"] == "ExpiredTokenException"
+                err.response["Error"]["Code"]
+                in ["ExpiredTokenException", "UnrecognizedClientException"]
                 and attempt < _RETRY_COUNT - 1
             ):
                 client = _get_lambda_client(refresh_client=True)

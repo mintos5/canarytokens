@@ -5,9 +5,10 @@ import binascii
 import json
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import cache
 from typing import Any, AnyStr, Match, Optional, Union
+import logging
 
 from jinja2 import Environment, FileSystemLoader
 from pydantic import parse_obj_as
@@ -25,16 +26,21 @@ from canarytokens.constants import (
 )
 from canarytokens.exceptions import NoCanarytokenFound
 from canarytokens.models import (
+    CANARYTOKEN_RE,
     AnyTokenHit,
+    AwsInfraAdditionalInfo,
+    AWSInfraTokenHit,
     AWSKeyTokenHit,
     AWSKeyTokenExposedHit,
     AzureIDTokenHit,
     SlackAPITokenHit,
+    CrowdStrikeCCTokenHit,
     TokenTypes,
     CreditCardV2TokenHit,
     CreditCardV2AdditionalInfo,
     WebDavTokenHit,
     WebDavAdditionalInfo,
+    AWSInfraAssetType,
 )
 from canarytokens.credit_card_v2 import AnyCreditCardTrigger
 
@@ -100,15 +106,6 @@ def get_template_env():
 
 
 class Canarytoken(object):
-    CANARY_RE = re.compile(
-        ".*(["
-        + "".join(CANARYTOKEN_ALPHABET)
-        + "]{"
-        + str(CANARYTOKEN_LENGTH)
-        + "}).*",
-        re.IGNORECASE,
-    )
-
     def __init__(self, value: Optional[AnyStr] = None):
         """Create a new Canarytoken instance. If no value was provided,
         generate a new canarytoken.
@@ -147,11 +144,14 @@ class Canarytoken(object):
         Exceptions:
         NoCanarytokenFound
         """
-        m = Canarytoken.CANARY_RE.match(haystack)
+        should_reverse = "/" not in haystack
+        m = CANARYTOKEN_RE.search(haystack[::-1] if should_reverse else haystack)
+
         if not m:
             raise NoCanarytokenFound(haystack)
 
-        return m.group(1)
+        result = m.group(0)
+        return result[::-1] if should_reverse else result
 
     def value(
         self,
@@ -173,11 +173,11 @@ class Canarytoken(object):
 
     @staticmethod
     def _sql_server_username(matches: Match[AnyStr]) -> dict[str, str]:
-        match = matches.group(1)
-        if isinstance(match, str):
-            raw_username: str = match
-        elif isinstance(match, bytes):
-            raw_username: str = match.decode()
+        username_match = matches.group(1)
+        if isinstance(username_match, str):
+            raw_username: str = username_match
+        elif isinstance(username_match, bytes):
+            raw_username: str = username_match.decode()
         else:
             raw_username: str = ""
         data = {}
@@ -197,11 +197,11 @@ class Canarytoken(object):
 
     @staticmethod
     def _linux_inotify(matches: Match[AnyStr]) -> dict[str, str]:
-        match = matches.group(1)
-        if isinstance(match, str):
-            filename: str = match.encode()
-        elif isinstance(match, bytes):
-            filename: str = match
+        filename_match = matches.group(1)
+        if isinstance(filename_match, str):
+            filename: str = filename_match.encode()
+        elif isinstance(filename_match, bytes):
+            filename: str = filename_match
         else:
             filename: str = b""
         data = {}
@@ -509,16 +509,75 @@ class Canarytoken(object):
         return SlackAPITokenHit(**hit_info)
 
     @staticmethod
+    def _parse_crowdstrike_cc_trigger(
+        request: Request,
+    ) -> CrowdStrikeCCTokenHit:
+        """When a CrowdStrike CC token is triggered, the gateway makes a POST
+        request back to switchboard. The `request` is processed, fields
+        extracted, and a `CrowdStrikeCCTokenHit` is created.
+
+        Args:
+            request (twisted.web.http.Request): containing CrowdStrike hit information.
+
+        Returns:
+            CrowdStrikeCCTokenHit: Structured CrowdStrike CC specific hit info.
+        """
+        hit_time = datetime.utcnow().strftime("%s.%f")
+
+        json_data = json.loads(request.content.read())
+        src_ip = json_data.get("src_ip", "127.0.0.1")
+        user_agent = json_data.get("user_agent", "")
+
+        geo_info = queries.get_geoinfo(ip=src_ip)
+        is_tor_relay = queries.is_tor_relay(src_ip)
+
+        additional_info = {
+            "CrowdStrike Log Data": {
+                k: [str(v)] if not isinstance(v, list) else v
+                for k, v in json_data.items()
+                if k not in ["src_ip", "user_agent"]
+            }
+        }
+
+        hit_info = {
+            "token_type": TokenTypes.CROWDSTRIKE_CC,
+            "time_of_hit": hit_time,
+            "input_channel": INPUT_CHANNEL_HTTP,
+            "src_ip": src_ip,
+            "geo_info": geo_info,
+            "is_tor_relay": is_tor_relay,
+            "user_agent": user_agent,
+            "additional_info": additional_info,
+        }
+        return CrowdStrikeCCTokenHit(**hit_info)
+
+    @staticmethod
     def _parse_credit_card_v2_trigger(
         request: Request,
     ) -> CreditCardV2TokenHit:
         request_data = json.loads(request.content.read().decode())
 
-        if request_data.get("merchant") is not None:
-            merchant = request_data["merchant"]
-            request_data[
-                "merchant"
-            ] = f"{merchant.get('name')}, {merchant.get('city')}, {merchant.get('country')}"
+        if merchant := request_data.get("merchant") or request_data.get(
+            "merchant_detail"
+        ):
+            merchant_identifier = merchant.get("identifier") or merchant.get(
+                "merchant_id"
+            )
+
+            if merchant_identifier := merchant.get("identifier") or merchant.get(
+                "merchant_id"
+            ):
+                request_data["merchant_identifier"] = merchant_identifier
+
+            request_data["merchant"] = ", ".join(
+                v
+                for v in (
+                    merchant.get("name"),
+                    merchant.get("city"),
+                    merchant.get("country"),
+                )
+                if v
+            )
 
         trigger_data = parse_obj_as(AnyCreditCardTrigger, request_data)
 
@@ -694,12 +753,14 @@ class Canarytoken(object):
             "https://"
         ):
             redirect_url = "http://" + redirect_url
-        template = get_template_env().get_template("browser_scanner.html")
-        return template.render(
-            key=canarydrop.triggered_details.hits[-1].time_of_hit,
-            canarytoken=canarydrop.canarytoken.value(),
-            redirect_url=redirect_url,
-        ).encode()
+        template_params = {
+            "key": canarydrop.triggered_details.hits[-1].time_of_hit,
+            "canarytoken": canarydrop.canarytoken.value(),
+            "redirect_url": redirect_url,
+            "include_browser_scanner": True,
+        }
+        template = get_template_env().get_template("fortune.html")
+        return template.render(**template_params).encode()
 
     @staticmethod
     def _get_info_for_web(request):
@@ -711,35 +772,24 @@ class Canarytoken(object):
         canarydrop: canarydrop.Canarydrop, request: Request
     ) -> bytes:
         if request.getHeader("Accept") and "text/html" in request.getHeader("Accept"):
+            request.setHeader("Content-Type", "text/html")
             if canarydrop.browser_scanner_enabled:
-                # set response mimetype
-                request.setHeader("Content-Type", "text/html")
-                # latest hit
                 latest_hit_time = canarydrop.triggered_details.hits[-1].time_of_hit
-                # set-up response template
-                browser_scanner_template_params = {
+                template_params = {
                     "key": latest_hit_time,
                     "canarytoken": canarydrop.canarytoken.value(),
                     "redirect_url": "",
+                    "include_browser_scanner": True,
+                    "include_pale_blue_dot": True,
                 }
-                template = get_template_env().get_template("browser_scanner.html")
-                # render template
-                return template.render(**browser_scanner_template_params).encode()
-
-            elif queries.get_return_for_token() == "fortune":  # gif
-                # set response mimetype
-                request.setHeader("Content-Type", "text/html")
-
-                # get fortune
-                # fortune = subprocess.check_output('/usr/games/fortune')
-                fortune = "fortune favours the brave"
-
-                # set-up response template
-                fortune_template_params = {"request": request, "fortune": fortune}
                 template = get_template_env().get_template("fortune.html")
-
-                # render template
-                return template.render(**fortune_template_params).encode()
+                return template.render(**template_params).encode()
+            elif queries.get_return_for_token() == "fortune":
+                template_params = {
+                    "include_pale_blue_dot": True,
+                }
+                template = get_template_env().get_template("fortune.html")
+                return template.render(**template_params).encode()
 
         request.setHeader("Content-Type", "image/gif")
         return GIF
@@ -794,48 +844,143 @@ class Canarytoken(object):
 
         if html_accepted and not image_accepted:
             if canarydrop.browser_scanner_enabled:
-                # set response mimetype
                 request.setHeader("Content-Type", "text/html")
-                # latest hit
                 latest_hit_time = canarydrop.triggered_details.hits[-1].time_of_hit
-                # set-up response template
-                browser_scanner_template_params = {
+                template_params = {
                     "key": latest_hit_time,
                     "canarytoken": canarydrop.canarytoken.value(),
                     "redirect_url": "",
+                    "include_browser_scanner": True,
+                    "include_pale_blue_dot": True,
                 }
-                template = get_template_env().get_template("browser_scanner.html")
-                # render template
-                return template.render(**browser_scanner_template_params).encode()
-
-            elif queries.get_return_for_token() == "fortune":  # gif
-                # set response mimetype
-                request.setHeader("Content-Type", "text/html")
-
-                # get fortune
-                # fortune = subprocess.check_output('/usr/games/fortune')
-                fortune = "fortune favours the brave"
-
-                # set-up response template
-                fortune_template_params = {"request": request, "fortune": fortune}
                 template = get_template_env().get_template("fortune.html")
-
-                # render template
-                return template.render(**fortune_template_params).encode()
+                return template.render(**template_params).encode()
+            elif queries.get_return_for_token() == "fortune":
+                request.setHeader("Content-Type", "text/html")
+                template_params = {
+                    "request": request,
+                    "include_pale_blue_dot": True,
+                }
+                template = get_template_env().get_template("fortune.html")
+                return template.render(**template_params).encode()
 
         _check_and_add_cors_headers(request)
 
         if canarydrop.web_image_enabled and canarydrop.web_image_path.exists():
-            # set response mimetype
-            mimetype = "image/{mime}".format(mime=canarydrop.web_image_path.suffix[-3:])
+            mimetype = "image/{mime}".format(mime=canarydrop.web_image_path.suffix[1:])
             request.setHeader("Content-Type", mimetype)
-            # read custom image
             with canarydrop.web_image_path.open(mode="rb") as fp:
                 contents = fp.read()
             return contents
 
         request.setHeader("Content-Type", "image/gif")
         return GIF
+
+    @staticmethod
+    def _get_asset_type(event_detail: dict) -> str:
+        resource_type_mapping = {
+            "AWS::S3::Bucket": AWSInfraAssetType.S3_BUCKET.value,
+            "AWS::DynamoDB::Table": AWSInfraAssetType.DYNAMO_DB_TABLE.value,
+            "AWS::SQS::Queue": AWSInfraAssetType.SQS_QUEUE.value,
+            "AWS::SecretsManager::Secret": AWSInfraAssetType.SECRETS_MANAGER_SECRET.value,
+            "AWS::SSM::Parameter": AWSInfraAssetType.SSM_PARAMETER.value,
+        }
+
+        event_source_mapping = {
+            "s3.amazonaws.com": AWSInfraAssetType.S3_BUCKET.value,
+            "dynamodb.amazonaws.com": AWSInfraAssetType.DYNAMO_DB_TABLE.value,
+            "sqs.amazonaws.com": AWSInfraAssetType.SQS_QUEUE.value,
+            "secretsmanager.amazonaws.com": AWSInfraAssetType.SECRETS_MANAGER_SECRET.value,
+            "ssm.amazonaws.com": AWSInfraAssetType.SSM_PARAMETER.value,
+        }
+
+        if resource_type := event_detail.get("resources", [{}])[0].get("type"):
+            if asset_type := resource_type_mapping.get(resource_type):
+                return asset_type
+
+            # Whenever this exception is thrown, update resource_type_mapping with missing value
+            logging.error(
+                f"Cloudtrail resource type {resource_type} is missing", exc_info=True
+            )
+
+        if event_source := event_detail.get("eventSource"):
+            if asset_type := event_source_mapping.get(event_source):
+                return asset_type
+            # Whenever this exception is thrown, update event_source_mapping with missing value
+            logging.error(
+                f"Cloudtrail event source {event_source} is missing", exc_info=True
+            )
+
+        logging.error(
+            "Could not match AWS Infra Canarytoken event (resource type or event source) to asset type",
+            exc_info=True,
+        )
+        return "Unknown"
+
+    @staticmethod
+    def _parse_aws_infra_trigger(request: Any) -> AWSInfraTokenHit:
+        event = request["cloudtrail_event"]
+        event_detail = event["detail"]
+        user = event_detail["userIdentity"]
+        resource_name_keys = [
+            "bucketName",
+            "tableName",
+            "queueName",
+            "queueUrl",
+            "secretId",
+            "name",
+        ]
+        src_ip = event_detail["sourceIPAddress"]
+        time_of_hit = datetime.strptime(event_detail["eventTime"], "%Y-%m-%dT%H:%M:%SZ")
+        if "arn" in user:
+            identity = f'{user.get("arn")} (type: {user["type"]})'
+        else:
+            identity = ", ".join(f"{k}: {v}" for k, v in user.items())
+        hit_info = {
+            "geo_info": queries.get_geoinfo(ip=src_ip),
+            "is_tor_relay": queries.is_tor_relay(src_ip),
+            "src_ip": src_ip,
+            "time_of_hit": datetime.now(timezone.utc).strftime("%s.%f"),
+            "user_agent": event_detail.get("userAgent"),
+            "additional_info": AwsInfraAdditionalInfo(
+                event={
+                    "Event Name": f'{event_detail["eventName"]} (source: {event_detail["eventSource"]})',
+                    "Event Time": f"{time_of_hit.isoformat()} UTC+0:00",
+                    "Account & Region": f'{event["account"]}, {event["region"]}',
+                },
+                decoy_resource={
+                    "asset_type": Canarytoken._get_asset_type(event_detail),
+                    "Asset Name": next(
+                        (
+                            v
+                            for k, v in (
+                                event_detail.get("requestParameters") or {}
+                            ).items()
+                            if k in resource_name_keys
+                        ),
+                        "",
+                    ),
+                    "Request Parameters": ", ".join(
+                        f"{k}: {v}"
+                        for k, v in (
+                            event_detail.get("requestParameters") or {}
+                        ).items()
+                    ),
+                },
+                identity={
+                    "User Identity": identity,
+                    "UserAgent": event_detail.get("userAgent"),
+                },
+                metadata={
+                    "Event ID": event_detail["eventID"],
+                    "ReadOnly Event": event_detail.get("readOnly"),
+                    "Event Category": event_detail["eventCategory"],
+                    "Classification": event["detail-type"],
+                },
+            ),
+        }
+
+        return AWSInfraTokenHit(**hit_info)
 
     @staticmethod
     def _get_info_for_legacy(request):
@@ -866,38 +1011,28 @@ class Canarytoken(object):
         """
 
         if request.getHeader("Accept") and "text/html" in request.getHeader("Accept"):
+            request.setHeader("Content-Type", "text/html")
             if canarydrop.browser_scanner_enabled:
-                # set response mimetype
-                request.setHeader("Content-Type", "text/html")
-                # latest hit
                 latest_hit_time = canarydrop.triggered_details.hits[-1].time_of_hit
-                # set-up response template
-                browser_scanner_template_params = {
+                template_params = {
                     "key": latest_hit_time,
                     "canarytoken": canarydrop.canarytoken.value(),
                     "redirect_url": "",
+                    "include_browser_scanner": True,
+                    "include_pale_blue_dot": True,
                 }
-                template = get_template_env().get_template("browser_scanner.html")
-                # render template
-                return template.render(**browser_scanner_template_params).encode()
-
-            elif queries.get_return_for_token() == "fortune":  # gif
-                # set response mimetype
-                request.setHeader("Content-Type", "text/html")
-
-                # get fortune
-                # fortune = subprocess.check_output('/usr/games/fortune')
-                fortune = "fortune favours the brave"
-
-                # set-up response template
-                fortune_template_params = {"request": request, "fortune": fortune}
                 template = get_template_env().get_template("fortune.html")
-
-                # render template
-                return template.render(**fortune_template_params).encode()
+                return template.render(**template_params).encode()
+            elif queries.get_return_for_token() == "fortune":
+                request.setHeader("Content-Type", "text/html")
+                template_params = {
+                    "request": request,
+                    "include_pale_blue_dot": True,
+                }
+                template = get_template_env().get_template("fortune.html")
+                return template.render(**template_params).encode()
 
         if canarydrop.web_image_enabled and canarydrop.web_image_path.exists():
-            # set response mimetype
             mimetype = "image/{mime}".format(mime=canarydrop.web_image_path.suffix[-3:])
             request.setHeader("Content-Type", mimetype)
             # read custom image

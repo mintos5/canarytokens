@@ -10,20 +10,44 @@ import base64
 import datetime
 import errno
 import hashlib
+from http.client import (
+    BAD_REQUEST,
+    OK,
+    SERVICE_UNAVAILABLE,
+    UNAUTHORIZED,
+)
+from itertools import islice
+import logging.config
 import os
 import textwrap
 from base64 import b64decode
 from functools import singledispatch
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional, Union
 from urllib.parse import unquote
+import logging
 
 import requests
+from canarytokens.aws_infra import data_generation
 import segno
 import sentry_sdk
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    Security,
+    status,
+    Header,
+)
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.security import APIKeyQuery
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -33,35 +57,73 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.redis import RedisIntegration
 
 import canarytokens
+from canarytokens.channel_output_email import EmailResponseStatuses, send_email
 import canarytokens.credit_card_v2 as credit_card_infra
 from canarytokens import extendtoken, kubeconfig, msreg, queries
 from canarytokens import wireguard as wg
 from canarytokens.authenticode import make_canary_authenticode_binary
+from canarytokens import aws_infra
 from canarytokens.awskeys import get_aws_key
 from canarytokens.azurekeys import get_azure_id
+from canarytokens.crowdstrikekeys import get_crowdstrike_key
 from canarytokens.canarydrop import Canarydrop
-from canarytokens.exceptions import CanarydropAuthFailure
+from canarytokens.exceptions import (
+    AWSInfraDataGenerationLimitReached,
+    CanarydropAuthFailure,
+    CanarytokenTypeNotEnabled,
+    NoCanarydropFound,
+    AWSInfraOperationNotAllowed,
+)
 from canarytokens.models import (
     PWA_APP_TITLES,
+    READABLE_TOKEN_TYPE_NAMES,
+    AWSInfraGenerateChildAssetsRequest,
+    AWSInfraGenerateChildAssetsResponse,
+    AWSInfraHandleResponse,
+    AWSInfraCheckRoleReceivedResponse,
+    AWSInfraGenerateDataChoiceRequest,
+    AWSInfraGenerateDataChoiceResponse,
+    AWSInfraHandleRequest,
+    AWSInfraInventoryCustomerAccountReceivedResponse,
+    AWSInfraManagementResponseRequest,
+    AWSInfraOperationType,
+    AWSInfraSavePlanRequest,
+    AWSInfraServiceError,
+    AWSInfraSetupIngestionReceivedResponse,
+    AWSInfraState,
+    AWSInfraTeardownReceivedResponse,
+    AWSInfraTriggerOperationRequest,
     AnyDownloadRequest,
     AnySettingsRequest,
+    AnyTokenEditRequest,
     AnyTokenRequest,
     AnyTokenResponse,
+    AWSInfraConfigStartRequest,
+    AWSInfraConfigStartResponse,
+    AWSInfraTokenRequest,
+    AWSInfraTokenResponse,
     AWSKeyTokenRequest,
     AWSKeyTokenResponse,
     AzureIDTokenRequest,
     AzureIDTokenResponse,
+    CrowdStrikeCCTokenRequest,
+    CrowdStrikeCCTokenResponse,
     CCTokenRequest,
     CCTokenResponse,
     ClonedWebTokenRequest,
     ClonedWebTokenResponse,
     CSSClonedWebTokenRequest,
     CSSClonedWebTokenResponse,
+    DefaultResponse,
     DeleteResponse,
     DownloadCSSClonedWebRequest,
     DownloadCSSClonedWebResponse,
     CMDTokenRequest,
     CMDTokenResponse,
+    FetchLinksMessage,
+    FetchLinksRequest,
+    FetchLinksResponse,
+    IPIgnoreListRequest,
     WindowsFakeFSTokenRequest,
     WindowsFakeFSTokenResponse,
     CreditCardV2TokenRequest,
@@ -179,13 +241,16 @@ from canarytokens.queries import (
 )
 from canarytokens.redismanager import DB
 from canarytokens.settings import FrontendSettings, SwitchboardSettings
-from canarytokens.tokens import Canarytoken
+from canarytokens.tokens import Canarytoken, get_template_env, set_template_env
 from canarytokens.utils import get_deployed_commit_sha
 from canarytokens.windows_fake_fs import windows_fake_fs
 from canarytokens.ziplib import make_canary_zip
 
+log = logging.getLogger("uvicorn")
+
 frontend_settings = FrontendSettings()
 switchboard_settings = SwitchboardSettings()
+set_template_env(Path(switchboard_settings.TEMPLATES_PATH))
 protocol = "https" if switchboard_settings.FORCE_HTTPS else "http"
 if switchboard_settings.USING_NGINX:
     canary_http_channel = f"{protocol}://{frontend_settings.DOMAINS[0]}"
@@ -237,7 +302,28 @@ if frontend_settings.NEW_UI:
     @app.get("/nest/generate")
     @app.get("/generate")
     def index(request: Request):
-        return vue_index.TemplateResponse("index.html", {"request": request})
+        response = vue_index.TemplateResponse("index.html", {"request": request})
+        if request.url.path not in ["/", "/nest"]:
+            robot_tags = ["noindex", "nofollow"]
+            response.headers["X-Robots-Tag"] = ", ".join(robot_tags)
+
+        return response
+
+    @app.get("/robots.txt")
+    def robots_txt():
+        txt_template = get_template_env().get_template("robots.txt")
+        return PlainTextResponse(
+            content=txt_template.render(),
+            status_code=200,
+        )
+
+    @app.get("/.well-known/security.txt")
+    def security_txt():
+        txt_template = get_template_env().get_template("security.txt")
+        return PlainTextResponse(
+            content=txt_template.render(),
+            status_code=200,
+        )
 
 
 ROOT_API_ENDPOINT = "/d3aece8093b71007b5ccfedad91ebb11"
@@ -266,7 +352,7 @@ if frontend_settings.NEW_UI:
             name="Vue Frontend Dist",
         )
     except RuntimeError:
-        print("Error: No Vue dist found. Is this the test Action?")
+        log.warning("Error: No Vue dist found. Is this the test Action?")
 
 templates = Jinja2Templates(directory=frontend_settings.TEMPLATES_PATH)
 
@@ -277,7 +363,7 @@ if (
 ):
     # Add sentry when running on a domain.
     app.add_middleware(SentryAsgiMiddleware)
-    print(f"Sentry enabled. Environment: {frontend_settings.SENTRY_ENVIRONMENT}")
+    log.info(f"Sentry enabled. Environment: {frontend_settings.SENTRY_ENVIRONMENT}")
 
 
 def capture_exception(error: BaseException, context: tuple[str, Any]):
@@ -346,6 +432,35 @@ def get_canarydrop_and_authenticate(token: str, auth: str = Security(auth_key)):
             status_code=403, detail="Token not found. Invalid `auth` and `token` pair."
         )
     return canarydrop
+
+
+def validate_handle(request: AWSInfraManagementResponseRequest):
+    operation = aws_infra.get_handle_operation(request.handle)
+    if operation is None:
+        raise HTTPException(status_code=400, detail="Handle does not exist.")
+    if request.operation.value != operation:
+        raise HTTPException(
+            status_code=400, detail="Operation does not match that of stored handle."
+        )
+    return request
+
+
+def validate_exclusive_handle(request: Request):
+    if isinstance(request, AWSInfraHandleRequest) and len(vars(request)) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="A handle request should only contain handle and no other keys.",
+        )
+    return request
+
+
+def authorize_aws_infra(authorization: Annotated[str, Header()]):
+    bearer_str = f"Bearer {aws_infra.get_shared_secret()}"
+    if bearer_str != authorization:
+        log.warning(f"{bearer_str} != {authorization}")
+        raise HTTPException(
+            status_code=401, detail="Invalid authorization token provided."
+        )
 
 
 @app.on_event("startup")
@@ -505,13 +620,15 @@ async def generate(request: Request) -> AnyTokenResponse:  # noqa: C901  # gen i
             token_request_details, "sql_server_trigger_name", None
         ),
         # TODO: Move this into the create_response - same for much of what is done above.
-        wg_key=wg.generateCanarytokenPrivateKey(
-            canarytoken.value(),
-            wg_private_key_seed=switchboard_settings.WG_PRIVATE_KEY_SEED,
-            wg_private_key_n=switchboard_settings.WG_PRIVATE_KEY_N,
-        )
-        if token_request_details.token_type == TokenTypes.WIREGUARD
-        else None,
+        wg_key=(
+            wg.generateCanarytokenPrivateKey(
+                canarytoken.value(),
+                wg_private_key_seed=switchboard_settings.WG_PRIVATE_KEY_SEED,
+                wg_private_key_n=switchboard_settings.WG_PRIVATE_KEY_N,
+            )
+            if token_request_details.token_type == TokenTypes.WIREGUARD
+            else None
+        ),
     )
 
     # add generate random hostname an token
@@ -603,6 +720,13 @@ async def settings_post(
         return JSONResponse({"message": "success"})
     else:
         return JSONResponse({"message": "failure"}, status_code=400)
+
+
+@api.post("/settings/ip-ignore-list")
+async def ip_ignore_list_post(request: IPIgnoreListRequest) -> JSONResponse:
+    canarydrop = get_canarydrop_and_authenticate(token=request.token, auth=request.auth)
+    canarydrop.set_ignored_ip_addresses(request.ip_ignore_list)
+    return JSONResponse({"message": "success"})
 
 
 @app.get(
@@ -726,6 +850,7 @@ async def api_generate(  # noqa: C901  # gen is large
         token_request_data["token_type"] = token_request_data.pop(
             "type", token_request_data.get("token_type", None)
         )
+    log.info(f"Token generate request received: {token_request_data}")
 
     try:
         token_request_details = parse_obj_as(AnyTokenRequest, token_request_data)
@@ -829,15 +954,16 @@ async def api_generate(  # noqa: C901  # gen is large
             token_request_details, "sql_server_trigger_name", None
         ),
         # TODO: Move this into the create_response - same for much of what is done above.
-        wg_key=wg.generateCanarytokenPrivateKey(
-            canarytoken.value(),
-            wg_private_key_seed=switchboard_settings.WG_PRIVATE_KEY_SEED,
-            wg_private_key_n=switchboard_settings.WG_PRIVATE_KEY_N,
-        )
-        if token_request_details.token_type == TokenTypes.WIREGUARD
-        else None,
+        wg_key=(
+            wg.generateCanarytokenPrivateKey(
+                canarytoken.value(),
+                wg_private_key_seed=switchboard_settings.WG_PRIVATE_KEY_SEED,
+                wg_private_key_n=switchboard_settings.WG_PRIVATE_KEY_N,
+            )
+            if token_request_details.token_type == TokenTypes.WIREGUARD
+            else None
+        ),
     )
-
     page = None
     if token_request_details.token_type == TokenTypes.PWA:
         page = "index.html"
@@ -946,6 +1072,16 @@ async def api_settings_post(
         return SettingsResponse(**{"message": "failure"})
 
 
+@api.post("/edit")
+async def api_edit(request: AnyTokenEditRequest) -> JSONResponse:
+    canarydrop = get_canarydrop_and_authenticate(
+        token=request.canarytoken, auth=request.auth_token
+    )
+    if canarydrop.edit(request):
+        return JSONResponse({"message": "success"})
+    return JSONResponse({"message": "Canarytoken can't be edited."}, status_code=400)
+
+
 @api.get(
     "/download",
     tags=["Canarytokens Downloads"],
@@ -962,6 +1098,84 @@ async def api_download(
         token=download_request.token, auth=download_request.auth
     )
     return create_download_response(download_request, canarydrop=canarydrop)
+
+
+@api.post(
+    "/fetchlinks",
+    tags=["Fetch Canarytokens"],
+    response_model=FetchLinksResponse,
+)
+async def api_mail_token_list(request: FetchLinksRequest) -> JSONResponse:
+    if frontend_settings.CLOUDFLARE_TURNSTILE_SECRET is None:
+        return JSONResponse(
+            content={"message": FetchLinksMessage.NOT_CONFIGURED.value},
+            status_code=SERVICE_UNAVAILABLE,
+        )
+    if not request.cf_turnstile_response:
+        return JSONResponse(
+            content={"message": FetchLinksMessage.TURNSTILE_REQUIRED.value},
+            status_code=UNAUTHORIZED,
+        )
+    if not is_valid_email(request.email):
+        return JSONResponse(
+            content={"message": FetchLinksMessage.INVALID_EMAIL.value},
+            status_code=BAD_REQUEST,
+        )
+    if not await queries.validate_turnstile(
+        cf_turnstile_secret=frontend_settings.CLOUDFLARE_TURNSTILE_SECRET,
+        cf_turnstile_response=request.cf_turnstile_response,
+    ):
+        return JSONResponse(
+            content={"message": FetchLinksMessage.INVALID_TURNSTILE.value},
+            status_code=UNAUTHORIZED,
+        )
+
+    token_set = queries.list_email_tokens(request.email)
+    if token_set:
+        drops = filter(
+            None,
+            map(lambda token: queries.get_canarydrop(Canarytoken(token)), token_set),
+        )
+        token_list = sorted(
+            drops, key=lambda canarydrop: canarydrop.created_at, reverse=True
+        )
+        template_params = {
+            "READABLE_TOKEN_TYPE_NAMES": READABLE_TOKEN_TYPE_NAMES,
+            "LIMIT": frontend_settings.TOKENS_FETCH_LIMIT,
+            "token_list": list(
+                islice(token_list, frontend_settings.TOKENS_FETCH_LIMIT)
+            ),
+            "token_list_length": len(token_list),
+            "public_domain": frontend_settings.DOMAINS[0],
+            "switchboard_scheme": switchboard_settings.SWITCHBOARD_SCHEME,
+        }
+        html_template_name = "token_list.html"
+        html_template = get_template_env().get_template(
+            f"emails/_generated_dont_edit_{html_template_name}"
+        )
+        txt_template = get_template_env().get_template("emails/token_list.txt")
+        html_body = html_template.render(**template_params)
+        txt_body = txt_template.render(**template_params)
+        email_response_status, _ = send_email(
+            switchboard_settings=switchboard_settings,
+            email_recipient=request.email,
+            email_subject="Your Canarytokens",
+            email_content_html=html_body,
+            email_content_text=txt_body,
+            from_email=switchboard_settings.ALERT_EMAIL_FROM_ADDRESS,
+            from_display=switchboard_settings.ALERT_EMAIL_FROM_DISPLAY,
+        )
+        if (
+            email_response_status is None
+            or email_response_status == EmailResponseStatuses.ERROR
+        ):
+            return JSONResponse(
+                content={"message": FetchLinksMessage.SEND_FAIL.value},
+                status_code=SERVICE_UNAVAILABLE,
+            )
+    return JSONResponse(
+        content={"message": FetchLinksMessage.SUCCESS.value}, status_code=OK
+    )
 
 
 @api.get("/commitsha")
@@ -1006,6 +1220,351 @@ async def api_credit_card_demo_trigger(request: Request) -> JSONResponse:
         return JSONResponse({"message": "Something went wrong!"}, status_code=500)
 
     return JSONResponse({"message": "Success"}, status_code=200)
+
+
+# TODO: Cleanup canarydrops in invalid states:
+#    - module snippet doesn't exist
+@api.post("/awsinfra/config-start")
+def api_awsinfra_config_start(
+    request: AWSInfraConfigStartRequest,
+) -> Union[AWSInfraConfigStartResponse, DefaultResponse]:
+    canarydrop = get_canarydrop_and_authenticate(
+        request.canarytoken, request.auth_token
+    )
+    # Make sure the state has been initialised
+    if not aws_infra.is_initialised(canarydrop):
+        raise HTTPException(
+            status_code=400,
+            detail="This AWS Infra Canarytoken hasn't been configured correctly.",
+        )
+    return AWSInfraConfigStartResponse(
+        result=True, role_setup_commands=aws_infra.get_role_create_commands(canarydrop)
+    )
+
+
+@api.post("/awsinfra/check-role", dependencies=[Depends(validate_exclusive_handle)])
+async def api_awsinfra_check_role(
+    request: Union[AWSInfraTriggerOperationRequest, AWSInfraHandleRequest],
+    response: Response,
+) -> Union[AWSInfraCheckRoleReceivedResponse, AWSInfraHandleResponse]:
+    if isinstance(request, AWSInfraTriggerOperationRequest):
+        canarydrop = get_canarydrop_and_authenticate(
+            request.canarytoken, request.auth_token
+        )
+
+        try:
+            aws_infra.update_state(
+                canarydrop, AWSInfraState.CHECK_ROLE, external_id=request.external_id
+            )
+        except AWSInfraOperationNotAllowed as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e),
+            )
+        handle_id = aws_infra.start_operation(
+            AWSInfraOperationType.CHECK_ROLE, canarydrop
+        )
+        return AWSInfraHandleResponse(handle=handle_id)
+
+    handle_response = await aws_infra.get_handle_response(
+        request.handle, AWSInfraOperationType.CHECK_ROLE
+    )
+    response.status_code = (
+        status.HTTP_200_OK if not handle_response.error else status.HTTP_400_BAD_REQUEST
+    )
+    if isinstance(handle_response, AWSInfraHandleResponse):
+        # Return early if this is a handle response (a response from the management account hasn't been received yet)
+        return handle_response
+    try:
+        canarydrop = aws_infra.get_canarydrop_from_handle(request.handle)
+    except NoCanarydropFound:
+        response.status_code = status.HTTP_404_NOT_FOUND
+        return handle_response
+
+    if handle_response.error:
+        aws_infra.mark_failed(
+            canarydrop
+        )  # mark fail for in case this is coming from a successful check-role
+    else:
+        aws_infra.mark_succeeded(canarydrop)
+    queries.save_canarydrop(canarydrop)
+    return handle_response
+
+
+@api.post(
+    "/awsinfra/inventory-customer-account",
+    dependencies=[Depends(validate_exclusive_handle)],
+)
+async def api_awsinfra_inventory_customer_account(
+    request: Union[AWSInfraTriggerOperationRequest, AWSInfraHandleRequest],
+    response: Response,
+) -> Union[AWSInfraInventoryCustomerAccountReceivedResponse, AWSInfraHandleResponse]:
+
+    if isinstance(request, AWSInfraTriggerOperationRequest):
+        canarydrop = get_canarydrop_and_authenticate(
+            request.canarytoken, request.auth_token
+        )
+        try:
+            aws_infra.update_state(canarydrop, AWSInfraState.INVENTORY)
+        except AWSInfraOperationNotAllowed as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e),
+            )
+        handle_id = aws_infra.start_operation(
+            AWSInfraOperationType.INVENTORY, canarydrop
+        )
+        return AWSInfraHandleResponse(handle=handle_id)
+
+    try:
+        canarydrop = aws_infra.get_canarydrop_from_handle(request.handle)
+    except NoCanarydropFound:
+        response.status_code = status.HTTP_404_NOT_FOUND
+        return AWSInfraInventoryCustomerAccountReceivedResponse(
+            handle=request.handle,
+            result=False,
+            message="Canarydrop not found.",
+        )
+
+    try:
+        handle_response = await aws_infra.get_handle_response(
+            request.handle, AWSInfraOperationType.INVENTORY
+        )
+    except AWSInfraDataGenerationLimitReached as e:
+        aws_infra.mark_succeeded(canarydrop)
+        queries.save_canarydrop(canarydrop)
+        return AWSInfraInventoryCustomerAccountReceivedResponse(
+            handle=request.handle,
+            result=False,
+            proposed_plan={},
+            message=str(e),
+            data_generation_remaining=data_generation.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    response.status_code = (
+        status.HTTP_200_OK if not handle_response.error else status.HTTP_400_BAD_REQUEST
+    )
+    if isinstance(handle_response, AWSInfraHandleResponse):
+        # Return early if this is a handle response (a response from the management account hasn't been received yet)
+        return handle_response
+
+    # Reload canarydrop to ensure we have the latest state
+    canarydrop = aws_infra.get_canarydrop_from_handle(request.handle)
+    if handle_response.error:
+        aws_infra.mark_failed(
+            canarydrop
+        )  # mark fail for in case this is coming from a successful inventory
+    else:
+        aws_infra.mark_succeeded(canarydrop)
+    queries.save_canarydrop(canarydrop)
+    return handle_response
+
+
+@api.post(
+    "/awsinfra/generate-child-assets",
+    dependencies=[Depends(validate_exclusive_handle)],
+)
+async def api_awsinfra_generate_child_assets(
+    request: AWSInfraGenerateChildAssetsRequest,
+    response: Response,
+) -> AWSInfraGenerateChildAssetsResponse:
+    canarydrop = get_canarydrop_and_authenticate(
+        request.canarytoken, request.auth_token
+    )
+    try:
+        aws_infra.update_state(canarydrop, AWSInfraState.GENERATE_CHILD_ASSETS)
+    except AWSInfraOperationNotAllowed as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+    try:
+        assets = await aws_infra.generate_child_assets(canarydrop, request.assets)
+        result = AWSInfraGenerateChildAssetsResponse(
+            assets=assets,
+            data_generation_remaining=data_generation.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    except AWSInfraDataGenerationLimitReached:
+        aws_infra.mark_succeeded(canarydrop)
+        response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        result = AWSInfraGenerateChildAssetsResponse(
+            assets=[],
+            data_generation_remaining=aws_infra.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    finally:
+        aws_infra.mark_succeeded(canarydrop)
+        queries.save_canarydrop(canarydrop)
+
+    return result
+
+
+@api.post("/awsinfra/generate-data-choices")
+async def api_awsinfra_generate_data_choices(
+    request: AWSInfraGenerateDataChoiceRequest, response: Response
+) -> AWSInfraGenerateDataChoiceResponse:
+    canarydrop = get_canarydrop_and_authenticate(
+        request.canarytoken, request.auth_token
+    )
+    try:
+        aws_infra.update_state(canarydrop, AWSInfraState.PLAN)
+    except AWSInfraOperationNotAllowed as e:
+        response.status_code = status.HTTP_400_BAD_REQUEST
+        return AWSInfraGenerateDataChoiceResponse(
+            result=False,
+            message=str(e),
+            data_generation_remaining=data_generation.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    try:
+        return AWSInfraGenerateDataChoiceResponse(
+            result=True,
+            proposed_data=await aws_infra.generate_data_choice(
+                canarydrop,
+                request.asset_type,
+                request.asset_field,
+                request.parent_asset_name,
+                request.plan.get("assets", []) if request.plan else None,
+            ),
+            data_generation_remaining=data_generation.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    except AWSInfraDataGenerationLimitReached as e:
+        response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        return AWSInfraGenerateDataChoiceResponse(
+            result=False,
+            message=str(e),
+            data_generation_remaining=aws_infra.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+    except ValueError as e:
+        log.error(f"Error generating data choice: {str(e)}")
+        response.status_code = status.HTTP_400_BAD_REQUEST
+        return AWSInfraGenerateDataChoiceResponse(
+            result=False,
+            message=f"Error generating data choice.: {str(e)}",
+            data_generation_remaining=data_generation.name_generation_limit_usage(
+                canarydrop
+            ).remaining,
+        )
+
+
+@api.post("/awsinfra/save-plan")
+async def api_awsinfra_save_plan(
+    request: AWSInfraSavePlanRequest, response: Response
+) -> DefaultResponse:
+    canarydrop = get_canarydrop_and_authenticate(
+        request.canarytoken, request.auth_token
+    )
+    try:
+        aws_infra.update_state(canarydrop, AWSInfraState.PLAN)
+        await aws_infra.setup_new_plan(canarydrop, request.plan["assets"])
+        aws_infra.mark_succeeded(canarydrop)
+        queries.save_canarydrop(canarydrop)
+
+    except (AWSInfraOperationNotAllowed, ValueError) as e:
+        response.status_code = status.HTTP_400_BAD_REQUEST
+        return DefaultResponse(result=False, message=str(e))
+
+    return DefaultResponse(result=True, message="")
+
+
+@api.post(
+    "/awsinfra/setup-ingestion", dependencies=[Depends(validate_exclusive_handle)]
+)
+async def api_awsinfra_setup_ingestion(
+    request: Union[AWSInfraTriggerOperationRequest, AWSInfraHandleRequest],
+    response: Response,
+) -> Union[AWSInfraSetupIngestionReceivedResponse, AWSInfraHandleResponse]:
+    if isinstance(request, AWSInfraTriggerOperationRequest):
+        canarydrop = get_canarydrop_and_authenticate(
+            request.canarytoken, request.auth_token
+        )
+        try:
+            aws_infra.update_state(canarydrop, AWSInfraState.SETUP_INGESTION)
+        except AWSInfraOperationNotAllowed as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e),
+            )
+        handle_id = aws_infra.start_operation(
+            AWSInfraOperationType.SETUP_INGESTION, canarydrop
+        )
+        return AWSInfraHandleResponse(handle=handle_id)
+    handle_response = await aws_infra.get_handle_response(
+        request.handle, AWSInfraOperationType.SETUP_INGESTION
+    )
+    response.status_code = (
+        status.HTTP_200_OK if not handle_response.error else status.HTTP_400_BAD_REQUEST
+    )
+    if isinstance(handle_response, AWSInfraHandleResponse):
+        # Return early if this is a handle response (a response from the management account hasn't been received yet)
+        return handle_response
+    try:
+        canarydrop = aws_infra.get_canarydrop_from_handle(request.handle)
+    except NoCanarydropFound:
+        response.status_code = status.HTTP_404_NOT_FOUND
+        return handle_response
+
+    if handle_response.error:
+        aws_infra.mark_failed(
+            canarydrop
+        )  # mark fail for in case this is coming from a successful setup-ingestion
+    else:
+        aws_infra.mark_succeeded(canarydrop)
+        aws_infra.mark_ingesting(canarydrop)
+    queries.save_canarydrop(canarydrop)
+    return handle_response
+
+
+@api.post("/awsinfra/teardown", dependencies=[Depends(validate_exclusive_handle)])
+async def api_awsinfra_teardown(
+    request: Union[AWSInfraTriggerOperationRequest, AWSInfraHandleRequest],
+    response: Response,
+) -> Union[AWSInfraTeardownReceivedResponse, AWSInfraHandleResponse]:
+    if isinstance(request, AWSInfraTriggerOperationRequest):
+        canarydrop = get_canarydrop_and_authenticate(
+            request.canarytoken, request.auth_token
+        )
+        handle_id = aws_infra.start_operation(
+            AWSInfraOperationType.TEARDOWN, canarydrop
+        )
+        return AWSInfraHandleResponse(handle=handle_id)
+
+    handle_response = await aws_infra.get_handle_response(
+        request.handle, AWSInfraOperationType.TEARDOWN
+    )
+
+    try:
+        canarydrop = aws_infra.get_canarydrop_from_handle(request.handle)
+    except NoCanarydropFound:
+        response.status_code = status.HTTP_404_NOT_FOUND
+        return handle_response
+    if (
+        handle_response.error
+        and handle_response.error
+        != AWSInfraServiceError.FAILURE_INGESTION_TEARDOWN.value
+    ):
+        response.status_code = status.HTTP_400_BAD_REQUEST
+    elif not isinstance(handle_response, AWSInfraHandleResponse):
+        queries.delete_canarydrop(canarydrop)
+    return handle_response
+
+
+@api.post("/awsinfra/management-response", dependencies=[Depends(authorize_aws_infra)])
+async def api_awsinfra_management_response(
+    authorization: Annotated[str, Header()],
+    request: AWSInfraManagementResponseRequest = Depends(validate_handle),
+) -> JSONResponse:
+    aws_infra.add_handle_response(request.handle, request.result)
+    return JSONResponse({"message": "Success"})
 
 
 @singledispatch
@@ -1227,9 +1786,11 @@ def _(
             }}
             """
         ).strip(),
-        filename=canarydrop.cert_file_name.replace(".pem", ".json")
-        if canarydrop.cert_file_name.endswith(".pem")
-        else canarydrop.cert_file_name,
+        filename=(
+            canarydrop.cert_file_name.replace(".pem", ".json")
+            if canarydrop.cert_file_name.endswith(".pem")
+            else canarydrop.cert_file_name
+        ),
     )
 
 
@@ -1311,9 +1872,9 @@ def _(
 ) -> DNSTokenResponse:
     return DNSTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1329,9 +1890,9 @@ def _(
 
     return Log4ShellTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1437,14 +1998,14 @@ def _(
 def _(
     token_request_details: WebBugTokenRequest, canarydrop: Canarydrop
 ) -> WebBugTokenResponse:
-    # TODO: add browser_scanner_enabled to WebBugTokenRequest
-    # canarydrop.browser_scanner_enabled = True
+    canarydrop.browser_scanner_enabled = True
+    save_canarydrop(canarydrop)
 
     return WebBugTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1466,9 +2027,9 @@ def _(
 
     return PWATokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1492,9 +2053,9 @@ def _(
     qr_code = segno.make(wg_conf).png_data_uri(scale=2)
     return WireguardTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1511,9 +2072,9 @@ def _(token_request_details: SQLServerTokenRequest, canarydrop: Canarydrop):
 
     return SQLServerTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1572,9 +2133,9 @@ def _create_aws_key_token_response(
 
     return AWSKeyTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1647,6 +2208,49 @@ def _create_azure_id_token_response(
 
 
 @create_response.register
+def _create_crowdstrike_cc_token_response(
+    token_request_details: CrowdStrikeCCTokenRequest,
+    canarydrop: Canarydrop,
+    settings: Optional[FrontendSettings] = None,
+) -> CrowdStrikeCCTokenResponse:
+    if settings is None:
+        settings = frontend_settings
+
+    if settings.CROWDSTRIKE_CC_CREATE_URL is None:
+        return JSONResponse(
+            {
+                "message": "This Canarytokens instance does not have CrowdStrike CC tokens enabled."
+            },
+            status_code=400,
+        )
+
+    key = get_crowdstrike_key(
+        token=canarydrop.canarytoken,
+        server=get_all_canary_domains()[0],
+        crowdstrike_url=settings.CROWDSTRIKE_CC_CREATE_URL,
+    )
+
+    canarydrop.crowdstrike_token_id = key["token_id"]
+    canarydrop.crowdstrike_client_id = key["client_id"]
+    canarydrop.crowdstrike_client_secret = key["client_secret"]
+    canarydrop.crowdstrike_base_url = key["base_url"]
+    canarydrop.generated_url = f"{canary_http_channel}/{canarydrop.canarytoken.value()}"
+    save_canarydrop(canarydrop)
+    return CrowdStrikeCCTokenResponse(
+        email=canarydrop.alert_email_recipient or "",
+        webhook_url=canarydrop.alert_webhook_url or "",
+        token=canarydrop.canarytoken.value(),
+        token_url=canarydrop.generated_url,
+        auth_token=canarydrop.auth,
+        hostname=canarydrop.generated_hostname,
+        url_components=list(canarydrop.get_url_components()),
+        client_id=canarydrop.crowdstrike_client_id,
+        client_secret=canarydrop.crowdstrike_client_secret,
+        base_url=canarydrop.crowdstrike_base_url,
+    )
+
+
+@create_response.register
 def _create_webdav_token_response(
     token_request_details: WebDavTokenRequest,
     canarydrop: Canarydrop,
@@ -1682,9 +2286,9 @@ def _create_webdav_token_response(
     )
     return WebDavTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.get_url([canary_http_channel]),
         auth_token=canarydrop.auth,
@@ -1704,9 +2308,9 @@ def _(
     queries.save_canarydrop(canarydrop=canarydrop)
     return CMDTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.get_url([canary_http_channel]),
         auth_token=canarydrop.auth,
@@ -1775,9 +2379,9 @@ def _(token_request_details: CCTokenRequest, canarydrop: Canarydrop) -> CCTokenR
 
     return CCTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.get_url([canary_http_channel]),
         auth_token=canarydrop.auth,
@@ -1797,9 +2401,9 @@ def _(token_request_details: CCTokenRequest, canarydrop: Canarydrop) -> CCTokenR
 def _(token_request_details: PDFTokenRequest, canarydrop: Canarydrop):
     return PDFTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.get_url([canary_http_channel]),
         auth_token=canarydrop.auth,
@@ -1853,9 +2457,9 @@ def _(
     save_canarydrop(canarydrop)
     return CustomBinaryTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1879,7 +2483,7 @@ def _(
 
     Raises:
         HTTPException: status 400 if Image Upload is not supported.
-        HTTPException: status 400 if file is not .png, .gif, .jpg
+        HTTPException: status 400 if file is not .png, .gif, .jpg, .jpeg
         HTTPException: status 400 if file is too large. See MAX_UPLOAD_SIZE
         HTTPException: status 400 if failed to save file.
 
@@ -1894,9 +2498,9 @@ def _(
     filename = token_request_details.web_image.filename
 
     # check file extension
-    if not filename.lower().endswith((".png", ".gif", ".jpg")):
+    if not filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg")):
         raise HTTPException(
-            status_code=400, detail="Uploaded image must be a PNG, GIF or JPG"
+            status_code=400, detail="Uploaded image must be a PNG, GIF, JPG or JPEG"
         )
 
     # extract file bytes and check file size
@@ -1914,7 +2518,7 @@ def _(
         pathjoin=os.path.join(
             frontend_settings.WEB_IMAGE_UPLOAD_PATH, random_name[:2], random_name[2:]
         ),
-        extension=filename.lower()[-3:],
+        extension=filename.lower().split(".")[-1],
     )
 
     # create local file
@@ -1932,7 +2536,7 @@ def _(
     with open(filepath, "wb") as fp:
         fp.write(filebody)
     # save to canarydrop
-    canarydrop.browser_scanner_enabled = False
+    canarydrop.browser_scanner_enabled = True
     canarydrop.web_image_enabled = True
     canarydrop.web_image_path = filepath
 
@@ -1940,9 +2544,9 @@ def _(
     # add_random_hit_to_drop_for_testing(canarydrop)
     return CustomImageTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1956,9 +2560,9 @@ def _(token_request_details: SvnTokenRequest, canarydrop: Canarydrop):
 
     return SvnTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1972,9 +2576,9 @@ def _(token_request_details: MsWordDocumentTokenRequest, canarydrop: Canarydrop)
 
     return MsWordDocumentTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -1988,9 +2592,9 @@ def _(token_request_details: MsExcelDocumentTokenRequest, canarydrop: Canarydrop
 
     return MsExcelDocumentTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -2003,9 +2607,9 @@ def _(token_request_details: MsExcelDocumentTokenRequest, canarydrop: Canarydrop
 def _(token_request_details: QRCodeTokenRequest, canarydrop: Canarydrop):
     return QRCodeTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=canarydrop.generated_url,
         auth_token=canarydrop.auth,
@@ -2046,9 +2650,9 @@ def _(token_request_details: KubeconfigTokenRequest, canarydrop: Canarydrop):
 def _(token_request_details: MySQLTokenRequest, canarydrop: Canarydrop):
     return MySQLTokenResponse(
         email=canarydrop.alert_email_recipient or "",
-        webhook_url=canarydrop.alert_webhook_url
-        if canarydrop.alert_webhook_url
-        else "",
+        webhook_url=(
+            canarydrop.alert_webhook_url if canarydrop.alert_webhook_url else ""
+        ),
         token=canarydrop.canarytoken.value(),
         token_url=HttpUrl(
             canarydrop.get_url(
@@ -2113,8 +2717,7 @@ def _(
 ) -> IdPAppTokenResponse:
     canarydrop.idp_app_entity_id = canarydrop.generated_url.removesuffix("/saml/sso")
     canarydrop.idp_app_type = token_request_details.app_type
-    if not canarydrop.redirect_url:
-        canarydrop.browser_scanner_enabled = True
+    canarydrop.browser_scanner_enabled = True
     save_canarydrop(canarydrop)
 
     return IdPAppTokenResponse(
@@ -2127,4 +2730,34 @@ def _(
         url_components=list(canarydrop.get_url_components()),
         entity_id=canarydrop.idp_app_entity_id,
         app_type=canarydrop.idp_app_type,
+    )
+
+
+@create_response.register
+def _(
+    token_request_details: AWSInfraTokenRequest, canarydrop: Canarydrop
+) -> AWSInfraTokenResponse:
+    canarydrop.aws_account_id = token_request_details.aws_account_number
+    canarydrop.aws_region = token_request_details.aws_region
+    try:
+        aws_infra.initialise(canarydrop)
+    except CanarytokenTypeNotEnabled as e:
+        return JSONResponse({"message": str(e)}, status_code=500)
+    except Exception:
+        return JSONResponse(
+            {"message": "Failed to generate AWS Infra Canarytoken."}, status_code=500
+        )
+    save_canarydrop(canarydrop)
+
+    return AWSInfraTokenResponse(
+        email=canarydrop.alert_email_recipient or "",
+        webhook_url=canarydrop.alert_webhook_url or "",
+        token=canarydrop.canarytoken.value(),
+        token_url=canarydrop.generated_url,
+        auth_token=canarydrop.auth,
+        hostname=canarydrop.generated_hostname,
+        aws_account_number=canarydrop.aws_account_id,
+        aws_region=canarydrop.aws_region,
+        tf_module_prefix=canarydrop.aws_tf_module_prefix,
+        ingesting=False,  # TODO: remove
     )

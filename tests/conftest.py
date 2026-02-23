@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 import time
-from distutils.util import strtobool
 from pathlib import Path
 from typing import Any, Generator, Optional
 from unittest import mock
@@ -33,6 +32,7 @@ from canarytokens.queries import (
 )
 from canarytokens.redismanager import DB, KEY_KUBECONFIG_CERTS, KEY_KUBECONFIG_SERVEREP
 from canarytokens.settings import FrontendSettings, Port, SwitchboardSettings
+from canarytokens.utils import strtobool
 
 # TODO: Once webhooker can handle more / faster traffic these will get upped
 # DESIGN: ngrok to get a basic webhook(er). This can be a lambda or a docker service.
@@ -161,35 +161,24 @@ def aws_webhook_receiver() -> Generator[str, None, None]:
         yield f"http://{config.host}:{config.port}"
 
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption("--runv3", action="store_true", default=False, help="run V3 tests")
-    parser.addoption("--runv2", action="store_true", default=False, help="run V2 tests")
-
-
-@pytest.fixture(scope="session")
-def runv2(request: pytest.FixtureRequest) -> bool:
-    return request.config.getoption("--runv2", False)
-
-
-@pytest.fixture(scope="session")
-def runv3(request: pytest.FixtureRequest) -> bool:
-    return request.config.getoption("--runv3", False)
-
-
 @pytest.fixture(scope="session")
 def settings() -> SwitchboardSettings:
     return SwitchboardSettings(
         PUBLIC_DOMAIN="127.0.0.1",
         CHANNEL_HTTP_PORT=Port(8084),
-        CHANNEL_SMTP_PORT=Port(25)
-        if strtobool(os.getenv("LIVE", "FALSE"))
-        else Port(2500),
-        MAILGUN_DOMAIN_NAME="eu-mg.honeypdfs.com"
-        if not os.getenv("CANARY_MAILGUN_DOMAIN_NAME")
-        else os.getenv("CANARY_MAILGUN_DOMAIN_NAME"),
-        MAILGUN_BASE_URL="https://api.eu.mailgun.net"
-        if not os.getenv("CANARY_MAILGUN_DOMAIN_NAME")
-        else os.getenv("CANARY_MAILGUN_BASE_URL"),
+        CHANNEL_SMTP_PORT=(
+            Port(25) if strtobool(os.getenv("LIVE", "FALSE")) else Port(2500)
+        ),
+        MAILGUN_DOMAIN_NAME=(
+            "eu-mg.honeypdfs.com"
+            if not os.getenv("CANARY_MAILGUN_DOMAIN_NAME")
+            else os.getenv("CANARY_MAILGUN_DOMAIN_NAME")
+        ),
+        MAILGUN_BASE_URL=(
+            "https://api.eu.mailgun.net"
+            if not os.getenv("CANARY_MAILGUN_DOMAIN_NAME")
+            else os.getenv("CANARY_MAILGUN_BASE_URL")
+        ),
         SENTRY_DSN=HttpUrl("https://not.using/in/tests", scheme="https"),
         WG_PRIVATE_KEY_SEED="vk/GD+frlhve/hDTTSUvqpQ/WsQtioKAri0Rt5mg7dw=",
     )
@@ -203,9 +192,9 @@ def fake_settings_for_aws_keys():
     return SwitchboardSettings(
         PUBLIC_DOMAIN="127.0.0.1",
         CHANNEL_HTTP_PORT=Port(8084),
-        CHANNEL_SMTP_PORT=Port(25)
-        if strtobool(os.getenv("LIVE", "FALSE"))
-        else Port(2500),
+        CHANNEL_SMTP_PORT=(
+            Port(25) if strtobool(os.getenv("LIVE", "FALSE")) else Port(2500)
+        ),
         SENTRY_DSN=HttpUrl("https://not.using/in/tests", scheme="https"),
         WG_PRIVATE_KEY_SEED="vk/GD+frlhve/hDTTSUvqpQ/WsQtioKAri0Rt5mg7dw=",
     )

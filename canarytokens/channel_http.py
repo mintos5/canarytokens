@@ -1,3 +1,5 @@
+from ipaddress import IPv4Address
+import json
 from typing import Optional
 
 from pydantic import ValidationError, parse_obj_as
@@ -14,7 +16,12 @@ from canarytokens import queries
 from canarytokens.channel import InputChannel
 from canarytokens.constants import INPUT_CHANNEL_HTTP
 from canarytokens.exceptions import NoCanarytokenFound, NoCanarydropFound
-from canarytokens.models import AnyTokenHit, AWSKeyTokenHit, TokenTypes
+from canarytokens.models import (
+    AnyTokenHit,
+    AWSKeyTokenHit,
+    AlertStatus,
+    TokenTypes,
+)
 from canarytokens.queries import get_canarydrop
 from canarytokens.saml import SAML_POST_ARG
 from canarytokens.settings import FrontendSettings, SwitchboardSettings
@@ -28,8 +35,6 @@ log = Logger()
 
 
 # from canarytokens.settings import
-
-
 class CanarytokenPage(InputChannel, resource.Resource):
     CHANNEL = INPUT_CHANNEL_HTTP
     isLeaf = True
@@ -144,6 +149,9 @@ class CanarytokenPage(InputChannel, resource.Resource):
                 log_failure=Failure(e),
             )
             return
+        if canarydrop.should_ignore_ip(IPv4Address(token_hit.src_ip)):
+            token_hit.alert_status = AlertStatus.IGNORED_IP
+
         canarydrop.add_canarydrop_hit(token_hit=token_hit)
         self.dispatch(canarydrop=canarydrop, token_hit=token_hit)
         # TODO: fix this. Making it type dispatched?
@@ -193,6 +201,11 @@ class CanarytokenPage(InputChannel, resource.Resource):
             canarydrop.add_canarydrop_hit(token_hit=token_hit)
             self.dispatch(canarydrop=canarydrop, token_hit=token_hit)
             return b"success"
+        elif canarydrop.type == TokenTypes.CROWDSTRIKE_CC:
+            token_hit = Canarytoken._parse_crowdstrike_cc_trigger(request)
+            canarydrop.add_canarydrop_hit(token_hit=token_hit)
+            self.dispatch(canarydrop=canarydrop, token_hit=token_hit)
+            return b"success"
         elif canarydrop.type == TokenTypes.SLACK_API:
             token_hit = Canarytoken._parse_slack_api_trigger(request)
             canarydrop.add_canarydrop_hit(token_hit=token_hit)
@@ -212,15 +225,22 @@ class CanarytokenPage(InputChannel, resource.Resource):
             TokenTypes.SLOW_REDIRECT,
             TokenTypes.WEB_IMAGE,
             TokenTypes.WEB,
+            TokenTypes.LEGACY,
         ]:
             key = request.args.get(b"key", [None])[0]
+            # if key is present then do special handling arguments,
+            # otherwise just use render_GET()
+            if not key:
+                return self.render_GET(request)
+
             if (key := coerce_to_float(key)) and token:
                 additional_info = {
                     k.decode(): v
                     for k, v in request.args.items()
                     if k.decode() not in ["key", "canarytoken", "name"]
                 }
-                canarydrop.add_additional_info_to_hit(
+                queries.add_additional_info_to_hit(
+                    canarytoken=canarydrop.canarytoken,
                     hit_time=key,
                     additional_info={
                         request.args[b"name"][0].decode(): additional_info
@@ -247,7 +267,8 @@ class CanarytokenPage(InputChannel, resource.Resource):
                     for k, v in request.args.items()
                     if k.decode() not in ["key", "canarytoken", "name"]
                 }
-                canarydrop.add_additional_info_to_hit(
+                queries.add_additional_info_to_hit(
+                    canarytoken=canarydrop.canarytoken,
                     hit_time=key,
                     additional_info={
                         request.args[b"name"][0].decode(): additional_info
@@ -264,6 +285,14 @@ class CanarytokenPage(InputChannel, resource.Resource):
                 )
                 # TODO: These returns are not really needed
                 return b"failed"
+        elif canarydrop.type == TokenTypes.AWS_INFRA:
+            content = json.load(request.content)
+            token_hit = Canarytoken._parse_aws_infra_trigger(content)
+            if canarydrop.should_ignore_ip(IPv4Address(token_hit.src_ip)):
+                token_hit.alert_status = AlertStatus.IGNORED_IP
+            canarydrop.add_canarydrop_hit(token_hit=token_hit)
+            self.dispatch(canarydrop=canarydrop, token_hit=token_hit)
+            return b"success"
         return self.render_GET(request)
 
 

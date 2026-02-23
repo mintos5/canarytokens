@@ -24,7 +24,6 @@ from canarytokens.redismanager import (
     KEY_WEBHOOK_IDX,
 )
 from canarytokens.queries import (
-    add_canarydrop_hit,
     delete_canarydrop,
     delete_email_tokens,
     delete_webhook_tokens,
@@ -80,6 +79,48 @@ def test_add_delete_email(setup_db):
     assert not db.exists(key)
 
 
+def test_email_case_management(setup_db):
+    db: StrictRedis = setup_db
+    email = "Test@test.com"
+
+    canarytoken = Canarytoken()
+    canarydrop = Canarydrop(
+        generate=True,
+        type=TokenTypes.DNS,
+        alert_email_enabled=True,
+        alert_email_recipient=email,
+        canarytoken=canarytoken,
+        memo="stuff happened",
+        browser_scanner_enabled=False,
+    )
+    save_canarydrop(canarydrop)
+
+    key = KEY_EMAIL_IDX + email
+    assert len(db.smembers(key)) == 0
+    assert len(db.smembers(key.lower())) == 1
+    assert (
+        db.hget(KEY_CANARYDROP + canarytoken.value(), "alert_email_recipient") == email
+    )
+
+    second_token = Canarytoken()
+    second_canarydrop = Canarydrop(
+        generate=True,
+        type=TokenTypes.DNS,
+        alert_email_enabled=True,
+        alert_email_recipient=email.lower(),
+        canarytoken=second_token,
+        memo="stuff happened",
+        browser_scanner_enabled=False,
+    )
+    save_canarydrop(second_canarydrop)
+
+    set_members = db.smembers(key.lower())
+    assert len(set_members) == 2
+    assert all([token.value() in set_members for token in [canarytoken, second_token]])
+
+    delete_email_tokens(key)
+
+
 def test_add_hit_get_canarytoken(setup_db):
     canarytoken = Canarytoken()
 
@@ -104,7 +145,7 @@ def test_add_hit_get_canarytoken(setup_db):
         is_tor_relay=False,
         input_channel="dns",
     )
-    add_canarydrop_hit(token_hit=token_hit, canarytoken=canarytoken)
+    canarydrop.add_canarydrop_hit(token_hit=token_hit)
     cd = get_canarydrop(canarytoken=canarytoken)
     assert cd.triggered_details
 
@@ -137,7 +178,7 @@ def test_add_hit_get_canarytoken_wrong_type(setup_db):
         useragent="Unknown",
     )
     with pytest.raises(ValueError):
-        add_canarydrop_hit(token_hit=token_hit, canarytoken=canarytoken)
+        canarydrop.add_canarydrop_hit(token_hit=token_hit)
     cd = get_canarydrop(canarytoken=canarytoken)
     assert cd.triggered_details
 
@@ -180,7 +221,7 @@ def test_delete_drop(setup_db):
         location="/get",
         useragent="Unknown",
     )
-    add_canarydrop_hit(token_hit=token_hit, canarytoken=canarytoken)
+    canarydrop.add_canarydrop_hit(token_hit=token_hit)
     cd = get_canarydrop(canarytoken=canarytoken)
 
     for key in critical_keys:

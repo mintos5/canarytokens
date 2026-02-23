@@ -1,7 +1,7 @@
 import os
-from distutils.util import strtobool
 from typing import Any, Literal, Optional
 
+from canarytokens.utils import strtobool
 from pydantic import BaseSettings, EmailStr, HttpUrl, SecretStr
 
 from canarytokens.models import Port
@@ -32,9 +32,10 @@ class SwitchboardSettings(BaseSettings):
     USING_NGINX: bool = True
     TEMPLATES_PATH: str = "../templates"
 
-    ALERT_EMAIL_FROM_ADDRESS: EmailStr = EmailStr("illegal@email.com")
+    ALERT_EMAIL_FROM_ADDRESS: EmailStr = EmailStr("your-email@example.com")
     ALERT_EMAIL_FROM_DISPLAY: str = "Canarytokens-Test"
     ALERT_EMAIL_SUBJECT: str = "Canarytokens Alert"
+    MAX_HISTORY: int = 50
     MAX_ALERTS_PER_MINUTE: int = 1
     # Maximum number of alert failures before a mechanism is disabled
     MAX_ALERT_FAILURES: int = 5
@@ -89,6 +90,7 @@ class FrontendSettings(BaseSettings):
     STATIC_FILES_PATH: str = "../templates/static"
     STATIC_FILES_APPLICATION_SUB_PATH: str = "/resources"
     STATIC_FILES_APPLICATION_INTERNAL_NAME: str = "resources"
+    TOKENS_FETCH_LIMIT: int = 1000
 
     # if None the API docs won't load. Loads at /API_HASH/{your_url}. Must start with a /
     API_REDOC_URL: Optional[str]
@@ -113,11 +115,13 @@ class FrontendSettings(BaseSettings):
     TESTING_AWS_OUTPUT: Optional[str] = "json"
     AZURE_ID_TOKEN_URL: Optional[HttpUrl]
     AZURE_ID_TOKEN_AUTH: Optional[str]
+    CROWDSTRIKE_CC_CREATE_URL: Optional[HttpUrl]
+    CROWDSTRIKE_CC_DELETE_URL: Optional[HttpUrl]
     GOOGLE_API_KEY: Optional[str]
     EXTEND_EMAIL: Optional[str]
     EXTEND_PASSWORD: Optional[SecretStr] = SecretStr("NoExtendPasswordFound")
     EXTEND_CARD_NAME: Optional[str]
-    CLOUDFRONT_URL: Optional[HttpUrl]
+    CLOUDFRONT_URL: HttpUrl = "https://SET-CLOUDFRONT-URL-IN-FRONTEND-DOT-ENV.invalid"
     CLOUDFLARE_ACCOUNT_ID: Optional[str] = ""
     CLOUDFLARE_NAMESPACE: Optional[str] = ""
     CLOUDFLARE_API_TOKEN: Optional[str] = ""
@@ -132,6 +136,25 @@ class FrontendSettings(BaseSettings):
     CREDIT_CARD_INFRA_REGION: Optional[str]
     CREDIT_CARD_INFRA_ACCESS_ROLE: Optional[str]
     CLOUDFLARE_TURNSTILE_SECRET: Optional[str]
+
+    AWS_INFRA_AWS_ACCOUNT: Optional[str]
+    AWS_INFRA_AWS_REGION: Optional[str]
+    AWS_INFRA_SHARED_SECRET: Optional[str]
+    AWS_INFRA_MANAGEMENT_REQUEST_SQS_URL: Optional[str]
+    AWS_INFRA_CALLBACK_DOMAIN: Optional[str] = "callback domain goes here"
+    AWS_INFRA_INGESTION_BUS: Optional[str]
+    AWS_INFRA_TF_MODULE_BUCKET: Optional[str]
+    AWS_INFRA_NAME_GENERATION_LIMIT: Optional[int] = 50
+    GEMINI_API_KEY: Optional[str]
+    GEMINI_MODEL: Optional[str] = "gemini-2.5-flash"
+    GEMINI_PROMPT_TEMPLATE: Optional[str]
+    GEMINI_SYSTEM_PROMPT: Optional[str]
+    GEMINI_TEMPERATURE: Optional[str] = "1.8"
+
+    # for local aws infra testing
+    AWS_ACCESS_KEY_ID: Optional[str]
+    AWS_SECRET_ACCESS_KEY: Optional[str]
+    AWS_SESSION_TOKEN: Optional[str]
 
     class Config:
         allow_mutation = False

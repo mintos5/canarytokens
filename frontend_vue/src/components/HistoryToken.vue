@@ -15,12 +15,6 @@
     </div>
   </template>
 
-  <BaseMessageBox
-    v-if="error"
-    variant="danger"
-    message="Oh no! Something went wrong. Please refresh the page or try again later."
-  >
-  </BaseMessageBox>
   <template v-if="hitsList">
     <!-- conditional { 'hidden md:block': selectedAlert } is a trick for mobile
     to show incident info all screen height -->
@@ -46,21 +40,36 @@
           />
         </li>
         <AlertsListDownload v-else />
-
-        <CardIncident
-          v-for="(incident, index) in hitsList"
-          :key="index"
-          :last-key="index === hitsList.length - 1"
-          :incident-id="incident.time_of_hit"
-          :incident-preview-info="{
-            Date: convertUnixTimeStampToDate(incident.time_of_hit),
-            IP: incident.src_ip,
-            Channel: incident.input_channel,
-          }"
-          @click="handleSelectAlert(incident)"
-        ></CardIncident>
+        <BaseMessageBox
+          v-if="error"
+          variant="danger"
+          message="Oh no! Something went wrong. Please refresh the page or try again later."
+        >
+        </BaseMessageBox>
+        <template v-if="hasCustomIncidentsList">
+          <component
+            :is="dynamicIncidentList"
+            :hits-list="hitsList"
+            @select-alert="(incident: HitsType) => handleSelectAlert(incident)"
+          />
+        </template>
+        <template v-else>
+          <CardIncident
+            v-for="(incident, index) in hitsList"
+            :key="index"
+            x
+            :last-key="index === hitsList.length - 1"
+            :incident-id="incident.time_of_hit"
+            :incident-preview-info="{
+              Date: convertUnixTimeStampToDate(incident.time_of_hit),
+              IP: incident.src_ip,
+              Channel: incident.input_channel,
+            }"
+            @click="handleSelectAlert(incident)"
+          ></CardIncident>
+        </template>
         <!-- Benner for small screens -->
-        <BannerDeviceCanarytools class="flex sm:hidden" />
+        <BannerDeviceCanarytools class="flex md:hidden" />
       </ul>
     </div>
     <div>
@@ -72,22 +81,33 @@
           <IncidentDetails
             v-if="selectedAlert"
             id="incident_detail"
-            :showingMap="showMap()"
+            :showing-map="showMap()"
             :hit-alert="selectedAlert"
             class="absolute top-[120px] left-[0] md:top-[0px] md:relative grid-areas z-10 md:overflow-scroll w-full sm:w-auto"
+            :token-type="tokenType"
             @close="selectedAlert = null"
           ></IncidentDetails>
         </transition>
-        <CustomMap v-if="showMap()" :hits-list="hitsList"></CustomMap>
+
+        <CustomMap
+          v-if="showMap()"
+          :hits-list="hitsList"
+        ></CustomMap>
       </div>
       <!-- Benner for larger screens -->
-      <BannerDeviceCanarytools class="hidden sm:flex" />
+      <BannerDeviceCanarytools class="hidden md:flex" />
     </div>
   </template>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import {
+  ref,
+  onMounted,
+  shallowRef,
+  defineAsyncComponent,
+  computed,
+} from 'vue';
 import type { Ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { historyToken } from '@/api/main.ts';
@@ -111,13 +131,37 @@ const route = useRoute();
 const router = useRouter();
 
 const isLoading = ref(false);
-const error = ref(null);
+const error = ref(false);
 const hitsList: Ref<HitsType[] | undefined> = ref();
 const selectedAlert = ref();
 const tokenType = ref();
+const dynamicIncidentList = shallowRef();
+
+const hasCustomIncidentsList = computed(() => {
+  const tokensWithCustomIncidentsList = [TOKENS_TYPE.AWS_INFRA];
+  return tokensWithCustomIncidentsList.includes(tokenType.value);
+});
 
 onMounted(async () => {
   await fetchTokenHistoryData();
+
+  if (hasCustomIncidentsList.value) {
+    try {
+      isLoading.value = true;
+      dynamicIncidentList.value = defineAsyncComponent(
+        () =>
+          import(
+            `@/components/tokens/${tokenType.value}/history/IncidentList.vue`
+          )
+      );
+      await dynamicIncidentList.value.__asyncLoader();
+      isLoading.value = false;
+    } catch (err) {
+      console.error(err);
+      error.value = true;
+      isLoading.value = false;
+    }
+  }
 });
 
 async function fetchTokenHistoryData() {
@@ -131,7 +175,9 @@ async function fetchTokenHistoryData() {
   try {
     const res = await historyToken(params);
     const historyTokenData = (await res.data) as HistoryTokenBackendType;
-    hitsList.value = historyTokenData.history.hits.sort((a, b) => b.time_of_hit - a.time_of_hit);
+    hitsList.value = historyTokenData.history.hits.sort(
+      (a, b) => b.time_of_hit - a.time_of_hit
+    );
     tokenType.value = historyTokenData.history.token_type;
 
     emits(
@@ -154,11 +200,11 @@ async function fetchTokenHistoryData() {
 
 async function handleSelectAlert(incident: HitsType) {
   await addViewTransition(() => {
-    selectedAlert.value = incident
+    selectedAlert.value = incident;
     const container = document.getElementById('incident_detail');
-  container
-    ? container.scrollTo({ top: 0, behavior: 'smooth' })
-    : window.scrollTo({ top: 0, behavior: 'smooth' });
+    container
+      ? container.scrollTo({ top: 0, behavior: 'smooth' })
+      : window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 }
 

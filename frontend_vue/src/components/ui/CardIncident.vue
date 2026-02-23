@@ -17,8 +17,16 @@
             :key="key"
             class="block"
           >
-            <span v-if="val !== null" class="capitalize text-grey-400">{{ key }}: </span>
-            <span v-if="val !== null" class="mr-8 font-semibold">{{ val }}</span>
+            <span
+              v-if="val !== null"
+              class="capitalize text-grey-400"
+              >{{ key }}:
+            </span>
+            <span
+              v-if="val !== null"
+              class="mr-8 font-semibold"
+              >{{ val }}</span
+            >
           </span>
         </span>
       </span>
@@ -38,7 +46,7 @@
 import AlertShieldIcon from '@/components/icons/AlertShieldIcon.vue';
 
 type incidentPreviewInfoType = {
-  [key: string]: string | Date;
+  [key: string]: string | Date | null;
 };
 
 defineProps<{

@@ -6,6 +6,7 @@
       <FilterButton
         id="filterAll"
         category="All"
+        category-type="Canarytokens"
         :selected="!filterValue"
         @click="filterValue = ''"
       />
@@ -15,6 +16,7 @@
       >
         <FilterButton
           :category="category"
+          category-type="Canarytokens"
           :selected="filterValue === category"
           @click="handleFilterByCategory(category)"
         />
@@ -44,10 +46,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
 import type { ComputedRef } from 'vue';
-import type {
-  TokenServicesType,
-  TokenServiceType,
-} from '@/utils/tokenServices';
+import type { TokenServicesType } from '@/utils/tokenServices';
 import { tokenServices } from '@/utils/tokenServices';
 import SearchBar from '@/components/ui/SearchBar.vue';
 import FilterButton from '@/components/ui/FilterButton.vue';
@@ -65,9 +64,7 @@ const emits = defineEmits([
 const filterValue = ref('');
 const searchValue = ref('');
 
-const filteredList: ComputedRef<
-  TokenServicesType | [string, TokenServiceType]
-> = computed(() => {
+const filteredList: ComputedRef<TokenServicesType> = computed(() => {
   const filteredByCategory = filterByCategory(tokenServices);
   const filteredBySearch = filterBySearch(tokenServices);
 
@@ -86,11 +83,11 @@ const filteredList: ComputedRef<
   return filterBySearch(filteredByCategory);
 });
 
-function filterBySearch(list: TokenServicesType) {
+function filterBySearch(list: TokenServicesType): TokenServicesType {
   if (!searchValue.value) {
     return list;
   }
-  return Object.entries(list).reduce((acc, [key, val]) => {
+  return Object.entries(list).reduce<TokenServicesType>((acc, [key, val]) => {
     if (val.label.toLowerCase().includes(searchValue.value.toLowerCase())) {
       return { ...acc, [key]: val };
     }
@@ -106,11 +103,11 @@ function filterBySearch(list: TokenServicesType) {
   }, {});
 }
 
-function filterByCategory(list: TokenServicesType) {
+function filterByCategory(list: TokenServicesType): TokenServicesType {
   if (!filterValue.value) {
     return list;
   }
-  return Object.entries(list).reduce((acc, [key, val]) => {
+  return Object.entries(list).reduce<TokenServicesType>((acc, [key, val]) => {
     if (
       Array.isArray(val.category) &&
       val.category.includes(filterValue.value)

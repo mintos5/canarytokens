@@ -7,19 +7,31 @@ import json
 import re
 import secrets
 from ipaddress import IPv4Address
+import textwrap
 from typing import Literal, Optional, Union
 
 import advocate
+import httpx
 import requests
 from pydantic import EmailStr, HttpUrl, ValidationError, parse_obj_as
 from twisted.logger import Logger
 
-from canarytokens import canarydrop as cand
-from canarytokens import models, tokens, constants
-from canarytokens.exceptions import CanarydropAuthFailure, NoCanarydropFound
+from canarytokens import (
+    canarydrop as cand,
+    constants,
+    models,
+    tokens,
+    wireguard,
+)
+from canarytokens.exceptions import (
+    CanarydropAuthFailure,
+    NoCanarydropFound,
+    NoCanarytokenFound,
+)
 from canarytokens.redismanager import (  # KEY_BITCOIN_ACCOUNT,; KEY_BITCOIN_ACCOUNTS,; KEY_CANARY_NXDOMAINS,; KEY_CANARYTOKEN_ALERT_COUNT,; KEY_CLONEDSITE_TOKEN,; KEY_CLONEDSITE_TOKENS,; KEY_IMGUR_TOKEN,; KEY_IMGUR_TOKENS,; KEY_KUBECONFIG_CERTS,; KEY_KUBECONFIG_HITS,; KEY_KUBECONFIG_SERVEREP,; KEY_LINKEDIN_ACCOUNT,; KEY_LINKEDIN_ACCOUNTS,; KEY_USER_ACCOUNT,
     DB,
     KEY_AUTH_IDX,
+    KEY_AWS_MANAGEMENT_LAMBDA_HANDLE,
     KEY_CANARY_DOMAINS,
     KEY_CANARY_GOOGLE_API_KEY,
     KEY_CANARY_IP_CACHE,
@@ -42,12 +54,14 @@ from canarytokens.redismanager import (  # KEY_BITCOIN_ACCOUNT,; KEY_BITCOIN_ACC
     KEY_WEBHOOK_IDX,
     KEY_WIREGUARD_KEYMAP,
 )
+from canarytokens.settings import SwitchboardSettings
 from canarytokens.webhook_formatting import (
     generate_webhook_test_payload,
     get_webhook_type,
 )
 
 log = Logger()
+switchboard_settings = SwitchboardSettings()
 
 
 def get_canarydrop(canarytoken: tokens.Canarytoken) -> Optional[cand.Canarydrop]:
@@ -72,6 +86,13 @@ def get_canarydrop(canarytoken: tokens.Canarytoken) -> Optional[cand.Canarydrop]
         canarydrop["key_exposed_details"] = json.loads(
             canarydrop.pop("key_exposed_details")
         )
+    if "aws_infra_state" in canarydrop:
+        canarydrop["aws_infra_state"] = int(canarydrop["aws_infra_state"])
+
+    if "alert_ignored_ips" in canarydrop:
+        canarydrop["alert_ignored_ips"] = list(
+            map(IPv4Address, json.loads(canarydrop["alert_ignored_ips"]))
+        )
 
     canarydrop["canarytoken"] = canarytoken
     try:
@@ -87,6 +108,8 @@ def get_canarydrop_and_authenticate(*, token: str, auth: str) -> cand.Canarydrop
         canarydrop = get_canarydrop(tokens.Canarytoken(token))
     except NoCanarydropFound:
         raise CanarydropAuthFailure("Canarydrop associated with token is missing.")
+    except NoCanarytokenFound:
+        raise CanarydropAuthFailure("Canarytoken doesn't exist.")
     if not secrets.compare_digest(token, canarydrop.canarytoken.value()):
         raise CanarydropAuthFailure(
             "Canarydrop associated with this auth has inconsistent token."
@@ -156,11 +179,11 @@ def add_canary_nxdomain(domain: str) -> int:
 
 
 def add_email_token_idx(email: str, canarytoken: str) -> int:
-    return DB.get_db().sadd(KEY_EMAIL_IDX + email, canarytoken)
+    return DB.get_db().sadd(KEY_EMAIL_IDX + email.lower(), canarytoken)
 
 
 def remove_email_token_idx(email: str, canarytoken: str) -> None:
-    DB.get_db().srem(KEY_EMAIL_IDX + email, canarytoken)
+    DB.get_db().srem(KEY_EMAIL_IDX + email.lower(), canarytoken)
 
 
 def add_webhook_token_idx(webhook: HttpUrl, canarytoken: str) -> int:
@@ -200,7 +223,7 @@ def delete_webhook_tokens(webhook: str):
 
 
 def list_email_tokens(email_address) -> set[str]:
-    return DB.get_db().smembers(KEY_EMAIL_IDX + email_address)
+    return DB.get_db().smembers(KEY_EMAIL_IDX + email_address.lower())
 
 
 def list_webhook_tokens(webhook) -> set[str]:
@@ -251,6 +274,20 @@ def delete_canarydrop(canarydrop: cand.Canarydrop) -> None:
 
     remove_auth_token_idx(canarydrop.auth, token)
 
+    if canarydrop.type == models.TokenTypes.WIREGUARD:
+        wireguard.deleteCanarytokenPrivateKey(canarydrop.wg_key)
+
+    if canarydrop.type == models.TokenTypes.CROWDSTRIKE_CC:
+        from canarytokens.crowdstrikekeys import delete_crowdstrike_key
+        from canarytokens.settings import FrontendSettings
+
+        settings = FrontendSettings()
+        if settings.CROWDSTRIKE_CC_DELETE_URL and canarydrop.crowdstrike_token_id:
+            delete_crowdstrike_key(
+                token_id=canarydrop.crowdstrike_token_id,
+                crowdstrike_url=settings.CROWDSTRIKE_CC_DELETE_URL,
+            )
+
 
 # def _v2_compatibility_serialize_canarydrop(serialized_drop:dict[str, str], canarydrop:cand.Canarydrop)->dict[str, str]:
 #     # V2 compatibility - timestamp and created_at are aliases
@@ -286,7 +323,6 @@ def _v2_compatibility_loading_triggered_details(key: str) -> str:
 
 def get_canarydrop_triggered_details(
     canarytoken: tokens.Canarytoken,
-    max_history: int = 10,
 ) -> models.AnyTokenHistory:
     """
     Returns the triggered list for a Canarydrop, or {} if it does not exist
@@ -305,35 +341,12 @@ def get_canarydrop_triggered_details(
             if k
             in sorted(
                 triggered_details.keys(),
-            )[-(max_history):]
+            )[
+                -(switchboard_settings.MAX_HISTORY) :  # noqa: E203
+            ]
         }
         triggered_details["token_type"] = token_type
     return parse_obj_as(models.AnyTokenHistory, triggered_details)
-
-
-def add_canarydrop_hit(token_hit: models.AnyTokenHit, canarytoken):
-    """
-    Add a hit to a canarydrop. A hit will capture the
-    Arguments:
-    canarytoken -- canarytoken object.
-    **kwargs   -- Additional details about the hit.
-    """
-    token_history = get_canarydrop_triggered_details(canarytoken)
-
-    if token_history.token_type != token_hit.token_type:
-        # Design: This might not hold in the future but for now this is true.
-        raise ValueError(
-            f"All hits must be of a single type. Given {token_hit.token_type}; existing {token_history.token_type}"
-        )
-
-    token_history.hits.append(token_hit)
-
-    DB.get_db().hset(
-        KEY_CANARYDROP + canarytoken.value(),
-        "triggered_list",
-        json.dumps(token_history.serialize_for_v2()),
-    )
-    return token_hit.time_of_hit
 
 
 def add_key_exposed_hit(
@@ -373,6 +386,15 @@ def add_key_exposed_hit(
 
 def add_additional_info_to_hit(canarytoken, hit_time, additional_info):
     triggered_details = get_canarydrop_triggered_details(canarytoken)
+    if not any(hit_time == o.time_of_hit for o in triggered_details.hits):
+        raise ValueError(
+            textwrap.dedent(
+                """
+                    Got additional details for a hit that does not exist.
+                    This is likely a use case we don't support yet but can.
+                """
+            )
+        )
     enriched_hit = next(
         filter(lambda o: o.time_of_hit == hit_time, triggered_details.hits)
     )
@@ -384,6 +406,7 @@ def add_additional_info_to_hit(canarytoken, hit_time, additional_info):
             models.CustomImageTokenHit,
             models.WebBugTokenHit,
             models.IdPAppTokenHit,
+            models.LegacyTokenHit,
         ),
     ):
         info = enriched_hit.additional_info.dict(exclude_unset=True, exclude_none=None)
@@ -393,6 +416,12 @@ def add_additional_info_to_hit(canarytoken, hit_time, additional_info):
         raise NotImplementedError(
             f"Additional info not supported for hit type: {type(enriched_hit)}"
         )
+    canarydrop = get_canarydrop(canarytoken)
+    if (
+        enriched_hit.token_type in models.IGNORABLE_IP_TOKENS
+        and IPv4Address(enriched_hit.src_ip) in canarydrop.alert_ignored_ips
+    ):
+        enriched_hit.alert_status = models.AlertStatus.IGNORED_IP
     triggered_details.hits.append(enriched_hit)
 
     # if "additional_info" not in triggered_details[hit_time]:
@@ -411,6 +440,22 @@ def add_additional_info_to_hit(canarytoken, hit_time, additional_info):
     )
     data = DB.get_db().hgetall(KEY_CANARYDROP + canarytoken.value())
     print(data)
+
+
+async def validate_turnstile(
+    cf_turnstile_secret: str, cf_turnstile_response: str
+) -> bool:
+    data = {
+        "secret": cf_turnstile_secret,
+        "response": cf_turnstile_response,
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify", json=data
+        )
+
+    result: dict[str, bool] = response.json()
+    return result.get("success", False)
 
 
 _ip_info_api_key = None
@@ -630,9 +675,7 @@ def get_all_mails_in_send_status(
     return mails_and_details
 
 
-def remove_mail_from_to_send_status(
-    token: str, time: datetime.datetime
-) -> tuple[
+def remove_mail_from_to_send_status(token: str, time: datetime.datetime) -> tuple[
     Optional[list[EmailStr]],
     Optional[Union[models.TokenAlertDetails, models.TokenExposedDetails]],
 ]:
@@ -915,8 +958,8 @@ def is_valid_email(email):
     regex = re.compile(
         r"^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
     )
-    match = regex.search(email.lower())
-    if not match:
+    valid_email_match = regex.search(email.lower())
+    if not valid_email_match:
         return False
     else:
         return True
@@ -1043,3 +1086,32 @@ def wireguard_keymap_del(public_key: bytes) -> None:
 
 def wireguard_keymap_get(public_key: bytes) -> Optional[str]:
     return DB.get_db().hget(KEY_WIREGUARD_KEYMAP, public_key)
+
+
+def add_aws_management_lambda_handle(
+    handle_id: str, handle: dict, handle_lifetime: int = 3600
+):
+    key = f"{KEY_AWS_MANAGEMENT_LAMBDA_HANDLE}{handle_id}"
+    DB.get_db().hset(
+        key,
+        mapping=handle,
+    )
+    DB.get_db().expire(key, handle_lifetime)
+
+
+def reset_aws_management_lambda_handle_received(handle_id: str, operation: str):
+    key = f"{KEY_AWS_MANAGEMENT_LAMBDA_HANDLE}{handle_id}"
+    DB.get_db().hset(
+        key, mapping={"response_received": "False", "operation": operation}
+    )
+
+
+def get_aws_management_lambda_handle(handle):
+    return DB.get_db().hgetall(f"{KEY_AWS_MANAGEMENT_LAMBDA_HANDLE}{handle}")
+
+
+def update_aws_management_lambda_handle(handle_id: str, response: str):
+    key = f"{KEY_AWS_MANAGEMENT_LAMBDA_HANDLE}{handle_id}"
+    DB.get_db().hset(
+        key, mapping={"response_content": response, "response_received": "True"}
+    )

@@ -1,6 +1,7 @@
 export type BaseFormValuesType = {
   email: string;
   memo: string;
+  [key: string]: string | number | undefined;
 };
 
 export interface QRCodeTokenBackendType extends NewTokenBackendType {
@@ -88,6 +89,9 @@ type CanaryDropType = {
   webdav_server: string;
   idp_app_entity_id: string | null;
   idp_app_type: string | null;
+  crowdstrike_client_id: string;
+  crowdstrike_client_secret: string;
+  crowdstrike_base_url: string;
 };
 
 type NullablePartial<T> = { [P in keyof T]: T[P] | null };
@@ -115,6 +119,8 @@ export type ManageTokenBackendType = {
   cc_v2_expiry_month: string;
   cc_v2_expiry_year: string;
   cc_v2_name_on_card: string;
+  aws_region: string;
+  aws_account_id: string;
 };
 
 export type NewTokenBackendType = {
@@ -166,6 +172,8 @@ export type NewTokenBackendType = {
   webdav_server: string | null;
   entity_id: string | null;
   app_type: string | null;
+  client_secret: string | null;
+  base_url: string | null;
 };
 
 export type AsnType = {
@@ -203,6 +211,30 @@ export type AWSLogDataType = {
   eventName?: string[] | null;
 };
 
+export type DecoyResourceType = {
+  asset_type: string;
+  'Asset Name': string;
+  'Request Parameters': string;
+};
+
+export type EventType = {
+  'Event Name': string;
+  'Event Time': string;
+  'Account & Region': string;
+};
+
+export type IdentityType = {
+  'User Identity': string;
+  UserAgent: string;
+};
+
+export type MetadataType = {
+  'Event ID'?: string;
+  'ReadOnly Event'?: boolean;
+  'Event Category'?: string;
+  Classification?: string;
+};
+
 export type AdditionalInfoType = {
   javascript?: null | string;
   browser?: null | string;
@@ -212,31 +244,26 @@ export type AdditionalInfoType = {
   aws_key_log_data?: AWSLogDataType | null;
   file_path?: null | string;
   useragent?: null | string;
+  merchant?: string;
+  merchant_identifier?: string;
+  transaction_amount?: string;
+  transaction_currency?: string;
+  masked_card_number?: string;
+  transaction_date?: string;
+  transaction_type?: string;
+  status?: string;
+  event?: EventType;
+  decoy_resource?: DecoyResourceType;
+  identity?: IdentityType;
+  metadata?: MetadataType;
 };
 
-type BasicInfoType = {
-  token_type: string;
-  input_channel: string;
-  src_data: string;
-  useragent: string | null;
-  last4: string | null;
-  amount: string | null;
-  merchant: string | null;
-  mail: string | null;
-  referer: string | null;
-  location:
-    | string
-    | GeolocationPosition
-    | GeolocationCoordinates
-    | CoordsType
-    | null;
-};
 
 export type HitsType = {
   time_of_hit: number;
-  src_ip: string;
-  geo_info: GeoInfo;
-  is_tor_relay: boolean;
+  src_ip: string | null;
+  geo_info: GeoInfo | null;
+  is_tor_relay: boolean | null;
   input_channel: string;
   src_data: null | any;
   useragent: string | null;
@@ -247,26 +274,11 @@ export type HitsType = {
   last4?: string | null;
   amount?: string | null;
   merchant?: string | null;
+  merchant_identifier?: string | null;
   mail?: string | null;
   referer?: string | null;
   referrer?: string | null;
   location?: string | GeolocationPosition | CoordsType | null;
-};
-
-export type FormattedHitsType = {
-  [key: string]:
-    | string
-    | boolean
-    | null
-    | GeoInfo
-    | BasicInfoType
-    | AdditionalInfoType;
-  time_of_hit: string;
-  src_ip: string;
-  geo_info: GeoInfo;
-  is_tor_relay: boolean | null;
-  basic_info: BasicInfoType;
-  additional_info: AdditionalInfoType;
 };
 
 export type HistoryType = {

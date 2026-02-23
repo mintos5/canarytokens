@@ -4,23 +4,33 @@ and records accounting information about the Canarytoken.
 
 Maps to the object stored in Redis.
 """
+
 from __future__ import annotations
 
 import csv
 import io
+from ipaddress import IPv4Address
 import json
 import logging
 import random
 import textwrap
+from string import hexdigits
 from base64 import b64encode
 from datetime import datetime, timedelta
 from hashlib import md5
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Literal, Optional, Union
+from canarytokens.settings import SwitchboardSettings
 from canarytokens.webdav import FsType
 
-from pydantic import AnyHttpUrl, BaseModel, Field, parse_obj_as, root_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    Field,
+    parse_obj_as,
+    root_validator,
+)
 
 from canarytokens import queries, tokens
 from canarytokens.constants import (
@@ -29,13 +39,17 @@ from canarytokens.constants import (
     OUTPUT_CHANNEL_WEBHOOK,
 )
 from canarytokens.models import (
+    IGNORABLE_IP_TOKENS,
+    AWSInfraState,
     Anonymous,
     AnySettingsRequest,
+    AnyTokenEditRequest,
     AnyTokenHistory,
     AnyTokenHit,
     AnyTokenExposedHit,
     BrowserScannerSettingsRequest,
     EmailSettingsRequest,
+    IPIgnoreSettingsRequest,
     IdPAppType,
     PWAType,
     TokenTypes,
@@ -45,6 +59,8 @@ from canarytokens.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+switchboard_settings = SwitchboardSettings()
 
 
 def make_auth_token():
@@ -96,6 +112,9 @@ class Canarydrop(BaseModel):
     alert_webhook_url: Optional[str]
     alert_failure_count: Optional[int]
 
+    alert_ip_ignore_enabled: bool = False
+    alert_ignored_ips: list[IPv4Address] = []
+
     # web image specific stuff
     web_image_enabled: bool = False
     web_image_path: Optional[Path]
@@ -124,9 +143,21 @@ class Canarydrop(BaseModel):
     # AWS key specific stuff
     aws_access_key_id: Optional[str]
     aws_secret_access_key: Optional[str]
-    aws_account_id: Optional[str]
     aws_output: Optional[str] = Field(alias="output")
+
+    # AWS key and AWS infra stuff
+    aws_account_id: Optional[str]
     aws_region: Optional[str] = Field(alias="region")
+
+    # AWS  infra specific stuff
+    aws_customer_iam_access_external_id: Optional[str]
+    aws_deployed_assets: Optional[str]
+    aws_inventoried_assets: Optional[str]
+    aws_saved_plan: Optional[str]
+    aws_tf_module_prefix: Optional[str]
+    aws_infra_ingestion_bus_name: Optional[str]
+    aws_infra_state: Optional[AWSInfraState]
+    aws_infra_inventory_role: Optional[str] = None
 
     # Azure key specific stuff
     app_id: Optional[str]
@@ -134,6 +165,12 @@ class Canarydrop(BaseModel):
     cert: Optional[str]
     cert_name: Optional[str]
     cert_file_name: Optional[str]
+
+    # CrowdStrike CC specific stuff
+    crowdstrike_token_id: Optional[str]
+    crowdstrike_client_id: Optional[str]
+    crowdstrike_client_secret: Optional[str]
+    crowdstrike_base_url: Optional[str]
 
     # HTTP style token specific stuff
     browser_scanner_enabled: Optional[bool]
@@ -191,7 +228,7 @@ class Canarydrop(BaseModel):
         # Check that the triggered_details 'token_type' matches the 'type' of the canarydrop.
         if getattr(values["triggered_details"], "token_type") != values["type"]:
             raise ValueError(
-                f"""trigger_details type must match drop type. Got:
+                f"""triggered_details type must match drop type. Got:
             {getattr(values["triggered_details"], "token_type")} != {values["type"]}
             """
             )
@@ -229,39 +266,25 @@ class Canarydrop(BaseModel):
             datetime: lambda v: v.strftime("%s.%f"),
         }
 
-    def add_additional_info_to_hit(
-        self,
-        hit_time: str,
-        additional_info: dict[str, str],
-    ) -> None:
-        """ """
-        trigger_details = queries.get_canarydrop_triggered_details(self.canarytoken)
-        if not any([hit_time == o.time_of_hit for o in trigger_details.hits]):
-            raise ValueError(
-                textwrap.dedent(
-                    """
-                Got additional details for a hit that does not exist.
-                This is likely a use case we don't support yet but can.
-            """
-                )
-            )
-
-        queries.add_additional_info_to_hit(self.canarytoken, hit_time, additional_info)
-
     def add_canarydrop_hit(self, *, token_hit: AnyTokenHit):
         """Adds a hit to the drops history `.triggered_details`.
 
         Args:
             token_hit (AnyTokenHit): Hit to add.
         """
-        queries.save_canarydrop(self)
+        if self.triggered_details.token_type != token_hit.token_type:
+            # Design: This might not hold in the future but for now this is true.
+            raise ValueError(
+                f"All hits must be of a single type. Given {token_hit.token_type}; existing {self.triggered_details.token_type}"
+            )
 
         self.triggered_details.hits.append(token_hit)
-
-        queries.add_canarydrop_hit(
-            token_hit=token_hit,
-            canarytoken=self.canarytoken,
+        max_hits = min(
+            len(self.triggered_details.hits), switchboard_settings.MAX_HISTORY
         )
+        self.triggered_details.hits = self.triggered_details.hits[-max_hits:]
+
+        queries.save_canarydrop(self)
 
     def add_key_exposed_hit(self, token_exposed_hit: AnyTokenExposedHit):
         if self.key_exposed_details is not None:
@@ -284,21 +307,52 @@ class Canarydrop(BaseModel):
         Returns:
             bool: True if a supported setting. False otherwise.
         """
-        if isinstance(setting_request, EmailSettingsRequest):
-            self.alert_email_enabled = setting_request.value == "on"
-        elif isinstance(setting_request, WebImageSettingsRequest):
-            self.web_image_enabled = setting_request.value == "on"
-        elif isinstance(setting_request, WebhookSettingsRequest):
-            self.alert_webhook_enabled = setting_request.value == "on"
-        elif isinstance(setting_request, BrowserScannerSettingsRequest):
-            self.browser_scanner_enabled = setting_request.value == "on"
-        else:
-            logger.error(
-                f"Canarydrops cannot apply a settings change for: {setting_request}"
-            )
-            return False
+        match setting_request:
+            case EmailSettingsRequest():
+                self.alert_email_enabled = setting_request.value == "on"
+            case WebImageSettingsRequest():
+                self.web_image_enabled = setting_request.value == "on"
+            case WebhookSettingsRequest():
+                self.alert_webhook_enabled = setting_request.value == "on"
+            case BrowserScannerSettingsRequest():
+                self.browser_scanner_enabled = setting_request.value == "on"
+            case IPIgnoreSettingsRequest():
+                if self.type not in IGNORABLE_IP_TOKENS:
+                    logger.debug(
+                        f"Canarytoken of type {self.type} does not support IP ignoring."
+                    )
+                    return False
+                self.alert_ip_ignore_enabled = setting_request.value == "on"
+            case _:
+                logger.error(
+                    f"Canarydrops cannot apply a settings change for: {setting_request}"
+                )
+                return False
         queries.save_canarydrop(self)
         return True
+
+    def edit(self, edit_request: AnyTokenEditRequest) -> bool:
+        """
+        Change one or more canarydrop fields to a new value.
+        """
+        # can only edit for new aws infra tokens or if check-role/inventory failed on a new token
+        if edit_request.token_type == TokenTypes.AWS_INFRA and (
+            self.aws_infra_state
+            in [
+                AWSInfraState.INITIAL,
+                AWSInfraState.CHECK_ROLE,
+                AWSInfraState.INVENTORY,
+            ]
+        ):
+            for field in edit_request:
+                if field in ["token", "auth"]:
+                    continue
+            setattr(self, field[0], field[1])
+            queries.save_canarydrop(self)
+            return True
+        else:
+            # Other token edits can go here
+            return False
 
     def get_url_components(
         self,
@@ -401,6 +455,29 @@ class Canarydrop(BaseModel):
         return clonedsite_js
 
     def get_cloned_site_css(self, cf_url: str):
+        def _ucc_swap(s: str, n=3) -> str:
+            """
+            Replaces ~n of the characters in the string with a CSS-encoded unicode codepoint.
+            """
+            idxs = random.sample(
+                [
+                    i
+                    for i in range(len(s))
+                    if s[min(len(s) - 1, i + 1)] not in hexdigits
+                ],
+                k=n,
+            )
+            return "".join(
+                [
+                    f"\\{ord(s[idx]):x}" if idx in idxs else s[idx]
+                    for idx in range(len(s))
+                ]
+            )
+
+        cfs = "\x2e\x63\x6c\x6f\x75\x64\x66\x72\x6f\x6e\x74\x2e\x6e\x65\x74"
+        if cfs in cf_url:
+            cf_url = cf_url[: -len(cfs)] + _ucc_swap(cfs)
+
         token_val = self.canarytoken.value()
         expected_referrer = quote(b64encode(self.expected_referrer.encode()).decode())
         clonedsite_css = textwrap.dedent(
@@ -419,6 +496,7 @@ class Canarydrop(BaseModel):
         magic_sauce = "SET @bb = CONCAT(\"CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD='my-secret-pw', SOURCE_RETRY_COUNT=1, "
         magic_sauce += f"SOURCE_PORT={port}, "
         magic_sauce += f"SOURCE_HOST='{domain}', "
+        magic_sauce += "SOURCE_SSL=0, "
         magic_sauce += f'SOURCE_USER=\'{token}", @@lc_time_names, @@hostname, "\';");'
         if not encoded:
             usage = textwrap.dedent(
@@ -500,6 +578,11 @@ class Canarydrop(BaseModel):
         # V2 stores `aws_region` as `region`
         if "aws_region" in serialized:
             serialized["region"] = serialized.pop("aws_region")
+
+        if "alert_ignored_ips" in serialized:
+            serialized["alert_ignored_ips"] = json.dumps(
+                list(map(str, serialized["alert_ignored_ips"]))
+            )
         return serialized
 
     def can_notify_again(self):
@@ -595,3 +678,10 @@ class Canarydrop(BaseModel):
     def disable_alert_email(self) -> None:
         self.alert_email_enabled = False
         queries.save_canarydrop(self)
+
+    def set_ignored_ip_addresses(self, ip_addresses: list[IPv4Address]):
+        self.alert_ignored_ips = ip_addresses
+        queries.save_canarydrop(self)
+
+    def should_ignore_ip(self, ip_address: IPv4Address) -> bool:
+        return self.alert_ip_ignore_enabled and ip_address in self.alert_ignored_ips

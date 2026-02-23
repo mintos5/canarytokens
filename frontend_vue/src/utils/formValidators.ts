@@ -7,9 +7,28 @@ import {
 import { isValidFileType, validFileExtensions } from './utils';
 
 type FieldsType = {
-  email: string | undefined;
-  memo: string;
-  webhook_url: string | undefined;
+  email?: string;
+  memo?: string;
+  webhook_url?: string;
+  redirect_url?: string;
+  cmd_process?: string;
+  azure_id_cert_file_name?: string;
+  web_image?: File;
+  signed_exe?: File;
+  sql_server_sql_action?: string;
+  sql_server_table_name?: string;
+  sql_server_view_name?: string;
+  clonedsite?: string;
+  expected_referrer?: string;
+  windows_fake_fs_root?: string;
+  windows_fake_fs_file_structure?: string;
+  icon?: string;
+  app_name?: string;
+  cf_turnstile_response?: string;
+  app_type?: string;
+  aws_region?: string;
+  aws_account_number?: number;
+  [key: string]: any;
 };
 
 type ValidateSchemaType = {
@@ -41,6 +60,9 @@ const validationNotificationSettings = {
   webhook_url: Yup.string().url(validationMessages.validURL),
 };
 
+const validDnsRegexPattern = /^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/;
+
+//@ts-expect-error comment out for POC
 export const formValidators: ValidateSchemaType = {
   [TOKENS_TYPE.WEB_BUG]: {
     schema: Yup.object().shape(validationNotificationSettings),
@@ -61,6 +83,9 @@ export const formValidators: ValidateSchemaType = {
     schema: Yup.object().shape(validationNotificationSettings),
   },
   [TOKENS_TYPE.AWS_KEYS]: {
+    schema: Yup.object().shape(validationNotificationSettings),
+  },
+  [TOKENS_TYPE.CROWDSTRIKE_CC]: {
     schema: Yup.object().shape(validationNotificationSettings),
   },
   [TOKENS_TYPE.FAST_REDIRECT]: {
@@ -177,13 +202,17 @@ export const formValidators: ValidateSchemaType = {
   [TOKENS_TYPE.CLONED_WEBSITE]: {
     schema: Yup.object().shape({
       ...validationNotificationSettings,
-      clonedsite: Yup.string().required('Domain is required'),
+      clonedsite: Yup.string()
+        .required('Domain is required')
+        .matches(validDnsRegexPattern, 'Must be valid domain eg: example.com'),
     }),
   },
   [TOKENS_TYPE.CSS_CLONED_SITE]: {
     schema: Yup.object().shape({
       ...validationNotificationSettings,
-      expected_referrer: Yup.string().required('Domain is required'),
+      expected_referrer: Yup.string()
+        .required('Domain is required')
+        .matches(validDnsRegexPattern, 'Must be valid domain eg: example.com'),
     }),
   },
   [TOKENS_TYPE.KUBECONFIG]: {
@@ -219,11 +248,10 @@ export const formValidators: ValidateSchemaType = {
       ...validationNotificationSettings,
       windows_fake_fs_root: Yup.string()
         .required('A file path is required')
-        .matches(
-          /^[a-zA-Z]:(\\[a-zA-Z0-9_.-]+)+\\?$/,
-          "Invalid file path"
-        ),
-      windows_fake_fs_file_structure: Yup.string().required('A file structure is required'),
+        .matches(/^[a-zA-Z]:(\\[a-zA-Z0-9_.-]+)+\\?$/, 'Invalid file path'),
+      windows_fake_fs_file_structure: Yup.string().required(
+        'A file structure is required'
+      ),
     }),
   },
   [TOKENS_TYPE.IDP_APP]: {
@@ -231,6 +259,20 @@ export const formValidators: ValidateSchemaType = {
       ...validationNotificationSettings,
       redirect_url: Yup.string(),
       app_type: Yup.string().required('App type is required'),
+    }),
+  },
+  [TOKENS_TYPE.AWS_INFRA]: {
+    schema: Yup.object().shape({
+      ...validationNotificationSettings,
+      aws_region: Yup.string().required('AWS region is required'),
+      aws_account_number: Yup.string()
+        .required('AWS account number is required')
+        .matches(/^\d+$/, 'AWS account must be a number')
+        .test(
+          'len',
+          'AWS account number must have 12 digits',
+          (val) => val.length === 12
+        ),
     }),
   },
 };
